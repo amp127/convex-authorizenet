@@ -1,7 +1,10 @@
 {
   "name": "convex-authorizenet",
   "description": "An Authorize.net component for Convex.",
-  "repository": "github:amp127/convex-authorizenet",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amp127/convex-authorizenet.git"
+  },
   "homepage": "https://github.com/amp127/convex-authorizenet#readme",
   "bugs": {
     "url": "https://github.com/amp127/convex-authorizenet/issues"
