@@ -24,14 +24,20 @@ import type { FunctionReference } from "convex/server";
 export type ComponentApi<Name extends string | undefined = string | undefined> =
   {
     private: {
-      handleCheckoutSessionCompleted: FunctionReference<
+      claimWebhookNotification: FunctionReference<
+        "mutation",
+        "internal",
+        { eventType: string; notificationId: string },
+        boolean,
+        Name
+      >;
+      handleCheckoutCompleted: FunctionReference<
         "mutation",
         "internal",
         {
-          metadata?: any;
-          mode: string;
-          stripeCheckoutSessionId: string;
-          stripeCustomerId?: string;
+          checkoutId: string;
+          customerProfileId?: string;
+          subscriptionId?: string;
         },
         null,
         Name
@@ -40,10 +46,10 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
+          customerProfileId: string;
           email?: string;
           metadata?: any;
           name?: string;
-          stripeCustomerId: string;
         },
         null,
         Name
@@ -51,7 +57,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       handleCustomerDeleted: FunctionReference<
         "mutation",
         "internal",
-        { stripeCustomerId: string },
+        { customerProfileId: string },
         null,
         Name
       >;
@@ -59,128 +65,117 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
+          customerProfileId: string;
           email?: string;
           metadata?: any;
           name?: string;
-          stripeCustomerId: string;
         },
         null,
         Name
       >;
-      handleInvoiceCreated: FunctionReference<
+      handleInvoiceUpsert: FunctionReference<
         "mutation",
         "internal",
         {
           amountDue: number;
           amountPaid: number;
           created: number;
+          customerProfileId: string;
           metadata?: any;
           status: string;
-          stripeCustomerId: string;
-          stripeInvoiceId: string;
-          stripeSubscriptionId?: string;
+          subscriptionId?: string;
+          transId: string;
         },
         null,
         Name
       >;
-      handleInvoicePaid: FunctionReference<
+      handlePaymentProfileDeleted: FunctionReference<
         "mutation",
         "internal",
-        { amountPaid: number; stripeInvoiceId: string },
+        { customerPaymentProfileId: string },
         null,
         Name
       >;
-      handleInvoicePaymentFailed: FunctionReference<
-        "mutation",
-        "internal",
-        { stripeInvoiceId: string },
-        null,
-        Name
-      >;
-      handlePaymentIntentSucceeded: FunctionReference<
+      handlePaymentUpsert: FunctionReference<
         "mutation",
         "internal",
         {
           amount: number;
           created: number;
           currency: string;
+          customerProfileId?: string;
           metadata?: any;
+          refTransId?: string;
           status: string;
-          stripeCustomerId?: string;
-          stripePaymentIntentId: string;
+          subscriptionId?: string;
+          transId: string;
         },
         null,
         Name
       >;
-      handleSubscriptionCreated: FunctionReference<
+      handleSubscriptionUpsert: FunctionReference<
         "mutation",
         "internal",
         {
-          cancelAt?: number;
-          cancelAtPeriodEnd: boolean;
-          currentPeriodEnd: number;
-          metadata?: any;
-          priceId: string;
-          quantity?: number;
-          status: string;
-          stripeCustomerId: string;
-          stripeSubscriptionId: string;
-        },
-        null,
-        Name
-      >;
-      handleSubscriptionDeleted: FunctionReference<
-        "mutation",
-        "internal",
-        {
+          amount?: number;
           cancelAt?: number;
           cancelAtPeriodEnd?: boolean;
           currentPeriodEnd?: number;
-          stripeSubscriptionId: string;
+          customerPaymentProfileId?: string;
+          customerProfileId?: string;
+          intervalLength?: number;
+          intervalUnit?: "days" | "months";
+          metadata?: any;
+          planKey?: string;
+          quantity?: number;
+          status: string;
+          subscriptionId: string;
+          unitAmount?: number;
         },
         null,
         Name
       >;
-      handleSubscriptionUpdated: FunctionReference<
+      insertCheckoutSession: FunctionReference<
         "mutation",
         "internal",
         {
-          cancelAt?: number;
-          cancelAtPeriodEnd: boolean;
-          currentPeriodEnd: number;
+          amount: number;
+          checkoutId: string;
+          customerProfileId?: string;
+          intervalLength?: number;
+          intervalUnit?: "days" | "months";
           metadata?: any;
-          priceId?: string;
-          quantity?: number;
-          status: string;
-          stripeCustomerId?: string;
-          stripeSubscriptionId: string;
+          mode: "payment" | "subscription" | "setup";
+          planKey?: string;
+          quantity: number;
         },
         null,
         Name
       >;
-      listSubscriptionsWithCreationTime: FunctionReference<
-        "query",
-        "internal",
-        { stripeCustomerId: string },
-        Array<{
-          _creationTime: number;
-          status: string;
-          stripeCustomerId: string;
-          stripeSubscriptionId: string;
-        }>,
-        Name
-      >;
-      updatePaymentCustomer: FunctionReference<
+      releaseWebhookNotification: FunctionReference<
         "mutation",
         "internal",
-        { stripeCustomerId: string; stripePaymentIntentId: string },
+        { notificationId: string },
         null,
         Name
       >;
       updateSubscriptionQuantityInternal: FunctionReference<
         "mutation",
         "internal",
-        { quantity: number; stripeSubscriptionId: string },
+        { amount: number; quantity: number; subscriptionId: string },
+        null,
+        Name
+      >;
+      upsertPaymentProfile: FunctionReference<
+        "mutation",
+        "internal",
+        {
+          brand?: string;
+          customerPaymentProfileId: string;
+          customerProfileId: string;
+          isDefault: boolean;
+          last4?: string;
+        },
         null,
         Name
       >;
@@ -190,10 +185,10 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
+          customerProfileId: string;
           email?: string;
           metadata?: any;
           name?: string;
-          stripeCustomerId: string;
         },
         string,
         Name
@@ -201,25 +196,31 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       getCheckoutSession: FunctionReference<
         "query",
         "internal",
-        { stripeCheckoutSessionId: string },
+        { checkoutId: string },
         {
+          amount: number;
+          checkoutId: string;
+          customerProfileId?: string;
+          intervalLength?: number;
+          intervalUnit?: "days" | "months";
           metadata?: any;
-          mode: string;
+          mode: "payment" | "subscription" | "setup";
+          planKey?: string;
+          quantity: number;
           status: string;
-          stripeCheckoutSessionId: string;
-          stripeCustomerId?: string;
+          subscriptionId?: string;
         } | null,
         Name
       >;
       getCustomer: FunctionReference<
         "query",
         "internal",
-        { stripeCustomerId: string },
+        { customerProfileId: string },
         {
+          customerProfileId: string;
           email?: string;
           metadata?: any;
           name?: string;
-          stripeCustomerId: string;
           userId?: string;
         } | null,
         Name
@@ -229,10 +230,10 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { email: string },
         {
+          customerProfileId: string;
           email?: string;
           metadata?: any;
           name?: string;
-          stripeCustomerId: string;
           userId?: string;
         } | null,
         Name
@@ -242,10 +243,10 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { userId: string },
         {
+          customerProfileId: string;
           email?: string;
           metadata?: any;
           name?: string;
-          stripeCustomerId: string;
           userId?: string;
         } | null,
         Name
@@ -253,16 +254,17 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       getPayment: FunctionReference<
         "query",
         "internal",
-        { stripePaymentIntentId: string },
+        { transId: string },
         {
           amount: number;
           created: number;
           currency: string;
+          customerProfileId?: string;
           metadata?: any;
           orgId?: string;
           status: string;
-          stripeCustomerId?: string;
-          stripePaymentIntentId: string;
+          subscriptionId?: string;
+          transId: string;
           userId?: string;
         } | null,
         Name
@@ -270,18 +272,23 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       getSubscription: FunctionReference<
         "query",
         "internal",
-        { stripeSubscriptionId: string },
+        { subscriptionId: string },
         {
+          amount: number;
           cancelAt?: number;
           cancelAtPeriodEnd: boolean;
           currentPeriodEnd: number;
+          customerPaymentProfileId?: string;
+          customerProfileId: string;
+          intervalLength: number;
+          intervalUnit: "days" | "months";
           metadata?: any;
           orgId?: string;
-          priceId: string;
-          quantity?: number;
+          planKey: string;
+          quantity: number;
           status: string;
-          stripeCustomerId: string;
-          stripeSubscriptionId: string;
+          subscriptionId: string;
+          unitAmount: number;
           userId?: string;
         } | null,
         Name
@@ -291,16 +298,21 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { orgId: string },
         {
+          amount: number;
           cancelAt?: number;
           cancelAtPeriodEnd: boolean;
           currentPeriodEnd: number;
+          customerPaymentProfileId?: string;
+          customerProfileId: string;
+          intervalLength: number;
+          intervalUnit: "days" | "months";
           metadata?: any;
           orgId?: string;
-          priceId: string;
-          quantity?: number;
+          planKey: string;
+          quantity: number;
           status: string;
-          stripeCustomerId: string;
-          stripeSubscriptionId: string;
+          subscriptionId: string;
+          unitAmount: number;
           userId?: string;
         } | null,
         Name
@@ -308,30 +320,36 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       listCheckoutSessions: FunctionReference<
         "query",
         "internal",
-        { stripeCustomerId: string },
+        { customerProfileId: string },
         Array<{
+          amount: number;
+          checkoutId: string;
+          customerProfileId?: string;
+          intervalLength?: number;
+          intervalUnit?: "days" | "months";
           metadata?: any;
-          mode: string;
+          mode: "payment" | "subscription" | "setup";
+          planKey?: string;
+          quantity: number;
           status: string;
-          stripeCheckoutSessionId: string;
-          stripeCustomerId?: string;
+          subscriptionId?: string;
         }>,
         Name
       >;
       listInvoices: FunctionReference<
         "query",
         "internal",
-        { stripeCustomerId: string },
+        { customerProfileId: string },
         Array<{
           amountDue: number;
           amountPaid: number;
           created: number;
+          customerProfileId: string;
           metadata?: any;
           orgId?: string;
           status: string;
-          stripeCustomerId: string;
-          stripeInvoiceId: string;
-          stripeSubscriptionId?: string;
+          subscriptionId?: string;
+          transId: string;
           userId?: string;
         }>,
         Name
@@ -344,12 +362,12 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           amountDue: number;
           amountPaid: number;
           created: number;
+          customerProfileId: string;
           metadata?: any;
           orgId?: string;
           status: string;
-          stripeCustomerId: string;
-          stripeInvoiceId: string;
-          stripeSubscriptionId?: string;
+          subscriptionId?: string;
+          transId: string;
           userId?: string;
         }>,
         Name
@@ -362,29 +380,43 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           amountDue: number;
           amountPaid: number;
           created: number;
+          customerProfileId: string;
           metadata?: any;
           orgId?: string;
           status: string;
-          stripeCustomerId: string;
-          stripeInvoiceId: string;
-          stripeSubscriptionId?: string;
+          subscriptionId?: string;
+          transId: string;
           userId?: string;
+        }>,
+        Name
+      >;
+      listPaymentProfiles: FunctionReference<
+        "query",
+        "internal",
+        { customerProfileId: string },
+        Array<{
+          brand?: string;
+          customerPaymentProfileId: string;
+          customerProfileId: string;
+          isDefault: boolean;
+          last4?: string;
         }>,
         Name
       >;
       listPayments: FunctionReference<
         "query",
         "internal",
-        { stripeCustomerId: string },
+        { customerProfileId: string },
         Array<{
           amount: number;
           created: number;
           currency: string;
+          customerProfileId?: string;
           metadata?: any;
           orgId?: string;
           status: string;
-          stripeCustomerId?: string;
-          stripePaymentIntentId: string;
+          subscriptionId?: string;
+          transId: string;
           userId?: string;
         }>,
         Name
@@ -397,11 +429,12 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           amount: number;
           created: number;
           currency: string;
+          customerProfileId?: string;
           metadata?: any;
           orgId?: string;
           status: string;
-          stripeCustomerId?: string;
-          stripePaymentIntentId: string;
+          subscriptionId?: string;
+          transId: string;
           userId?: string;
         }>,
         Name
@@ -414,11 +447,12 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           amount: number;
           created: number;
           currency: string;
+          customerProfileId?: string;
           metadata?: any;
           orgId?: string;
           status: string;
-          stripeCustomerId?: string;
-          stripePaymentIntentId: string;
+          subscriptionId?: string;
+          transId: string;
           userId?: string;
         }>,
         Name
@@ -426,18 +460,23 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
       listSubscriptions: FunctionReference<
         "query",
         "internal",
-        { stripeCustomerId: string },
+        { customerProfileId: string },
         Array<{
+          amount: number;
           cancelAt?: number;
           cancelAtPeriodEnd: boolean;
           currentPeriodEnd: number;
+          customerPaymentProfileId?: string;
+          customerProfileId: string;
+          intervalLength: number;
+          intervalUnit: "days" | "months";
           metadata?: any;
           orgId?: string;
-          priceId: string;
-          quantity?: number;
+          planKey: string;
+          quantity: number;
           status: string;
-          stripeCustomerId: string;
-          stripeSubscriptionId: string;
+          subscriptionId: string;
+          unitAmount: number;
           userId?: string;
         }>,
         Name
@@ -447,16 +486,21 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { orgId: string },
         Array<{
+          amount: number;
           cancelAt?: number;
           cancelAtPeriodEnd: boolean;
           currentPeriodEnd: number;
+          customerPaymentProfileId?: string;
+          customerProfileId: string;
+          intervalLength: number;
+          intervalUnit: "days" | "months";
           metadata?: any;
           orgId?: string;
-          priceId: string;
-          quantity?: number;
+          planKey: string;
+          quantity: number;
           status: string;
-          stripeCustomerId: string;
-          stripeSubscriptionId: string;
+          subscriptionId: string;
+          unitAmount: number;
           userId?: string;
         }>,
         Name
@@ -466,16 +510,21 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { userId: string },
         Array<{
+          amount: number;
           cancelAt?: number;
           cancelAtPeriodEnd: boolean;
           currentPeriodEnd: number;
+          customerPaymentProfileId?: string;
+          customerProfileId: string;
+          intervalLength: number;
+          intervalUnit: "days" | "months";
           metadata?: any;
           orgId?: string;
-          priceId: string;
-          quantity?: number;
+          planKey: string;
+          quantity: number;
           status: string;
-          stripeCustomerId: string;
-          stripeSubscriptionId: string;
+          subscriptionId: string;
+          unitAmount: number;
           userId?: string;
         }>,
         Name
@@ -486,16 +535,9 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         {
           metadata: any;
           orgId?: string;
-          stripeSubscriptionId: string;
+          subscriptionId: string;
           userId?: string;
         },
-        null,
-        Name
-      >;
-      updateSubscriptionQuantity: FunctionReference<
-        "action",
-        "internal",
-        { quantity: number; stripeSubscriptionId: string },
         null,
         Name
       >;

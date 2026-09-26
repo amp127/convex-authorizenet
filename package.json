@@ -1,16 +1,17 @@
 {
-  "name": "@convex-dev/stripe",
-  "description": "A stripe component for Convex.",
-  "repository": "github:get-convex/stripe",
-  "homepage": "https://github.com/get-convex/stripe#readme",
+  "name": "@convex-dev/authorizenet",
+  "description": "An Authorize.net component for Convex.",
+  "repository": "github:amp127/convex-authorizenet",
+  "homepage": "https://github.com/amp127/convex-authorizenet#readme",
   "bugs": {
-    "url": "https://github.com/get-convex/stripe/issues"
+    "url": "https://github.com/amp127/convex-authorizenet/issues"
   },
-  "version": "0.1.6",
+  "version": "0.1.0",
   "license": "Apache-2.0",
   "keywords": [
     "convex",
-    "component"
+    "component",
+    "authorizenet"
   ],
   "type": "module",
   "scripts": {
@@ -40,18 +41,21 @@
     "./package.json": "./package.json",
     ".": {
       "types": "./dist/client/index.d.ts",
+      "@convex-dev/component-source": "./src/client/index.ts",
       "default": "./dist/client/index.js"
     },
     "./react": {
       "types": "./dist/react/index.d.ts",
+      "@convex-dev/component-source": "./src/react/index.ts",
       "default": "./dist/react/index.js"
     },
-    "./test": "./src/test.ts",
     "./_generated/component.js": {
-      "types": "./dist/component/_generated/component.d.ts"
+      "types": "./dist/component/_generated/component.d.ts",
+      "default": "./src/component/_generated/component.ts"
     },
     "./convex.config.js": {
       "types": "./dist/component/convex.config.d.ts",
+      "@convex-dev/component-source": "./src/component/convex.config.ts",
       "default": "./dist/component/convex.config.js"
     }
   },
@@ -92,8 +96,5 @@
     "ws": "8.21.0"
   },
   "types": "./dist/client/index.d.ts",
-  "module": "./dist/client/index.js",
-  "dependencies": {
-    "stripe": "^22.2.1"
-  }
+  "module": "./dist/client/index.js"
 }

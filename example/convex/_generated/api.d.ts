@@ -8,8 +8,8 @@
  * @module
  */
 
+import type * as authorizenet from "../authorizenet.js";
 import type * as http from "../http.js";
-import type * as stripe from "../stripe.js";
 
 import type {
   ApiFromModules,
@@ -18,8 +18,8 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  authorizenet: typeof authorizenet;
   http: typeof http;
-  stripe: typeof stripe;
 }>;
 
 /**
@@ -49,5 +49,5 @@ export declare const internal: FilterApi<
 >;
 
 export declare const components: {
-  stripe: import("@convex-dev/stripe/_generated/component.js").ComponentApi<"stripe">;
+  authorizenet: import("@convex-dev/authorizenet/_generated/component.js").ComponentApi<"authorizenet">;
 };

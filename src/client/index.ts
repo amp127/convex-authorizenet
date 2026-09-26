@@ -1,280 +1,173 @@
 import { httpActionGeneric } from "convex/server";
-import StripeSDK from "stripe";
+import {
+  AuthorizeNetClient,
+  type Environment,
+  type GatewayCustomer,
+  type GatewaySubscription,
+} from "./api.js";
+import {
+  addInterval,
+  createCheckoutId,
+  currentPeriodEndUnix,
+  mapSubscriptionStatus,
+  paymentStatusFromEvent,
+  type BillingInterval,
+  type IntervalUnit,
+} from "./billing.js";
+import { centsToDollars } from "./money.js";
+import { verifyWebhookSignature } from "./signature.js";
 import type {
-  MutationCtx,
   ActionCtx,
+  AuthorizeNetEventHandlers,
+  AuthorizeNetNotification,
   HttpRouter,
   RegisterRoutesConfig,
-  StripeEventHandlers,
-  StripeApiVersion,
 } from "./types.js";
 import type { ComponentApi } from "../component/_generated/component.js";
 
-type StripeClientConfig = ConstructorParameters<typeof StripeSDK>[1];
-type StripeClientConfigWithApiVersion = Omit<
-  NonNullable<StripeClientConfig>,
-  "apiVersion"
-> & {
-  apiVersion?: StripeApiVersion;
+export type AuthorizeNetComponent = ComponentApi;
+
+export type { RegisterRoutesConfig, AuthorizeNetEventHandlers, AuthorizeNetNotification };
+
+const OPEN_ENDED_OCCURRENCES = 9999;
+
+type CheckoutSession = {
+  checkoutId: string;
+  customerProfileId?: string;
+  status: string;
+  mode: "payment" | "subscription" | "setup";
+  amount: number;
+  quantity: number;
+  planKey?: string;
+  intervalLength?: number;
+  intervalUnit?: IntervalUnit;
+  subscriptionId?: string;
+  metadata?: Record<string, unknown>;
 };
 
-export type StripeComponent = ComponentApi;
+type StoredSubscription = {
+  subscriptionId: string;
+  customerProfileId: string;
+  customerPaymentProfileId?: string;
+  status: string;
+  amount: number;
+  unitAmount: number;
+  quantity: number;
+  intervalLength: number;
+  intervalUnit: IntervalUnit;
+  planKey: string;
+  currentPeriodEnd: number;
+  cancelAtPeriodEnd: boolean;
+  cancelAt?: number;
+  metadata?: Record<string, unknown>;
+};
 
-export type { RegisterRoutesConfig, StripeEventHandlers };
+type Credentials = {
+  apiLoginId?: string;
+  transactionKey?: string;
+  signatureKey?: string;
+  environment: Environment;
+  currency: string;
+};
+
+function environmentFrom(value: string | undefined): Environment {
+  if (!value || value === "sandbox") return "sandbox";
+  if (value === "production") return "production";
+  throw new Error(
+    "AUTHORIZENET_ENVIRONMENT must be sandbox or production",
+  );
+}
+
+function credentialsFrom(options?: {
+  apiLoginId?: string;
+  transactionKey?: string;
+  signatureKey?: string;
+  environment?: Environment;
+  currency?: string;
+}): Credentials {
+  return {
+    apiLoginId: options?.apiLoginId ?? process.env.AUTHORIZENET_API_LOGIN_ID,
+    transactionKey:
+      options?.transactionKey ?? process.env.AUTHORIZENET_TRANSACTION_KEY,
+    signatureKey: options?.signatureKey ?? process.env.AUTHORIZENET_SIGNATURE_KEY,
+    environment:
+      options?.environment ??
+      environmentFrom(process.env.AUTHORIZENET_ENVIRONMENT),
+    currency: options?.currency ?? "usd",
+  };
+}
+
+function requireApiCredentials(credentials: Credentials): {
+  apiLoginId: string;
+  transactionKey: string;
+} {
+  if (!credentials.apiLoginId || !credentials.transactionKey) {
+    throw new Error(
+      "AUTHORIZENET_API_LOGIN_ID and AUTHORIZENET_TRANSACTION_KEY must be set",
+    );
+  }
+  return {
+    apiLoginId: credentials.apiLoginId,
+    transactionKey: credentials.transactionKey,
+  };
+}
+
+function isNotification(value: unknown): value is AuthorizeNetNotification {
+  if (!value || typeof value !== "object") return false;
+  const event = value as Partial<AuthorizeNetNotification>;
+  return (
+    typeof event.notificationId === "string" &&
+    typeof event.eventType === "string" &&
+    typeof event.eventDate === "string" &&
+    typeof event.webhookId === "string" &&
+    !!event.payload &&
+    typeof event.payload === "object" &&
+    (typeof event.payload.id === "string" || typeof event.payload.id === "number")
+  );
+}
+
+function createdUnix(submitTimeUTC: string | undefined, eventDate: string): number {
+  const parsed = Date.parse(submitTimeUTC ?? eventDate);
+  if (Number.isNaN(parsed)) return Math.floor(Date.now() / 1000);
+  return Math.floor(parsed / 1000);
+}
 
 /**
- * Stripe Component Client
+ * Authorize.net payments, customer profiles, and ARB subscriptions.
  *
- * Provides methods for managing Stripe customers, subscriptions, payments,
- * and webhooks through Convex.
+ * API credentials stay in the app process. The component only stores synced records.
+ * Authorize.net has no idempotency key, so two overlapping getOrCreateCustomer calls
+ * for a brand-new user can create two customer profiles. Call it once per user.
  */
-export class StripeSubscriptions {
-  private _apiKey: string;
-  private _stripeConfig: StripeClientConfigWithApiVersion | undefined;
+export class AuthorizeNet {
+  private readonly credentials: Credentials;
+
   constructor(
-    public component: StripeComponent,
+    public component: AuthorizeNetComponent,
     options?: {
-      STRIPE_SECRET_KEY?: string;
-      apiVersion?: StripeApiVersion;
+      apiLoginId?: string;
+      transactionKey?: string;
+      signatureKey?: string;
+      environment?: Environment;
+      currency?: string;
     },
   ) {
-    this._apiKey = options?.STRIPE_SECRET_KEY ?? process.env.STRIPE_SECRET_KEY!;
-    this._stripeConfig = options?.apiVersion
-      ? { apiVersion: options.apiVersion }
-      : undefined;
-  }
-  get apiKey() {
-    if (!this._apiKey) {
-      throw new Error("STRIPE_SECRET_KEY environment variable is not set");
-    }
-    return this._apiKey;
+    this.credentials = credentialsFrom(options);
   }
 
-  private stripe() {
-    return new StripeSDK(this.apiKey, this._stripeConfig as StripeClientConfig);
-  }
-
-  /**
-   * Update subscription quantity (for seat-based pricing).
-   * This will update both Stripe and the local database.
-   */
-  async updateSubscriptionQuantity(
-    ctx: ActionCtx,
-    args: {
-      stripeSubscriptionId: string;
-      quantity: number;
-    },
-  ) {
-    const stripe = this.stripe();
-    const subscription = await stripe.subscriptions.retrieve(
-      args.stripeSubscriptionId,
+  private gateway(): AuthorizeNetClient {
+    const credentials = requireApiCredentials(this.credentials);
+    return new AuthorizeNetClient(
+      credentials.apiLoginId,
+      credentials.transactionKey,
+      this.credentials.environment,
     );
-
-    if (!subscription.items.data[0]) {
-      throw new Error("Subscription has no items");
-    }
-
-    await stripe.subscriptionItems.update(subscription.items.data[0].id, {
-      quantity: args.quantity,
-    });
-
-    await ctx.runMutation(this.component.private.updateSubscriptionQuantityInternal, {
-      stripeSubscriptionId: args.stripeSubscriptionId,
-      quantity: args.quantity,
-    });
-
-    return null;
   }
 
   /**
-   * Cancel a subscription either immediately or at period end.
-   * Updates both Stripe and the local database.
-   */
-  async cancelSubscription(
-    ctx: ActionCtx,
-    args: {
-      stripeSubscriptionId: string;
-      cancelAtPeriodEnd?: boolean;
-    },
-  ) {
-    const stripe = this.stripe();
-    const cancelAtPeriodEnd = args.cancelAtPeriodEnd ?? true;
-
-    let subscription: StripeSDK.Subscription;
-
-    if (cancelAtPeriodEnd) {
-      subscription = await stripe.subscriptions.update(
-        args.stripeSubscriptionId,
-        {
-          cancel_at_period_end: true,
-        },
-      );
-    } else {
-      subscription = await stripe.subscriptions.cancel(
-        args.stripeSubscriptionId,
-      );
-    }
-
-    // Update local database immediately (don't wait for webhook)
-    const item = subscription.items.data[0];
-    await ctx.runMutation(this.component.private.handleSubscriptionUpdated, {
-      stripeSubscriptionId: subscription.id,
-      stripeCustomerId: getStripeObjectId(subscription.customer),
-      status: subscription.status,
-      currentPeriodEnd: item?.current_period_end || 0,
-      cancelAtPeriodEnd: subscription.cancel_at_period_end ?? false,
-      cancelAt: subscription.cancel_at || undefined,
-      quantity: item?.quantity ?? 1,
-      priceId: item?.price?.id || undefined,
-      metadata: subscription.metadata || {},
-    });
-
-    return null;
-  }
-
-  /**
-   * Reactivate a subscription that was set to cancel at period end.
-   * Updates both Stripe and the local database.
-   */
-  async reactivateSubscription(
-    ctx: ActionCtx,
-    args: {
-      stripeSubscriptionId: string;
-    },
-  ) {
-    const stripe = this.stripe();
-
-    // Reactivate by setting cancel_at_period_end to false
-    const subscription = await stripe.subscriptions.update(
-      args.stripeSubscriptionId,
-      {
-        cancel_at_period_end: false,
-      },
-    );
-
-    // Update local database immediately
-    const item = subscription.items.data[0];
-    await ctx.runMutation(this.component.private.handleSubscriptionUpdated, {
-      stripeSubscriptionId: subscription.id,
-      stripeCustomerId: getStripeObjectId(subscription.customer),
-      status: subscription.status,
-      currentPeriodEnd: item?.current_period_end || 0,
-      cancelAtPeriodEnd: subscription.cancel_at_period_end ?? false,
-      cancelAt: subscription.cancel_at || undefined,
-      quantity: item?.quantity ?? 1,
-      priceId: item?.price?.id || undefined,
-      metadata: subscription.metadata || {},
-    });
-
-    return null;
-  }
-
-  // ============================================================================
-  // CHECKOUT & PAYMENTS
-  // ============================================================================
-
-  /**
-   * Create a Stripe Checkout session for one-time payments or subscriptions.
-   *
-   * Use `params` to pass additional Stripe Checkout Session parameters directly
-   * to the Stripe API. Values in `params` override constructed defaults except
-   * `mode`, which remains controlled by the top-level argument.
-   */
-  async createCheckoutSession(
-    ctx: ActionCtx,
-    args: {
-      priceId: string;
-      customerId?: string;
-      mode: "payment" | "subscription" | "setup";
-      successUrl: string;
-      cancelUrl: string;
-      quantity?: number;
-      metadata?: Record<string, string>;
-      /** Metadata to attach to the subscription (only for mode: "subscription") */
-      subscriptionMetadata?: Record<string, string>;
-      /** Metadata to attach to the payment intent (only for mode: "payment") */
-      paymentIntentMetadata?: Record<string, string>;
-      /** Additional Stripe Checkout Session parameters passed through to the API */
-      params?: Partial<StripeSDK.Checkout.SessionCreateParams>;
-    },
-  ) {
-    const stripe = this.stripe();
-
-    const sessionParams: StripeSDK.Checkout.SessionCreateParams = {
-      mode: args.mode,
-      line_items: [
-        {
-          price: args.priceId,
-          quantity: args.quantity ?? 1,
-        },
-      ],
-      success_url: args.successUrl,
-      cancel_url: args.cancelUrl,
-      metadata: args.metadata || {},
-    };
-
-    if (args.customerId) {
-      sessionParams.customer = args.customerId;
-    }
-
-    // Add subscription metadata for linking userId/orgId
-    if (args.mode === "subscription" && args.subscriptionMetadata) {
-      sessionParams.subscription_data = {
-        metadata: args.subscriptionMetadata,
-      };
-    }
-
-    // Add payment intent metadata for linking userId/orgId
-    if (args.mode === "payment" && args.paymentIntentMetadata) {
-      sessionParams.payment_intent_data = {
-        metadata: args.paymentIntentMetadata,
-      };
-    }
-
-    const { mode: _mode, ...paramsOverrides } = args.params || {};
-    const finalParams: StripeSDK.Checkout.SessionCreateParams = {
-      ...sessionParams,
-      ...paramsOverrides,
-    };
-    if (sessionParams.subscription_data || paramsOverrides.subscription_data) {
-      finalParams.subscription_data = {
-        ...sessionParams.subscription_data,
-        ...paramsOverrides.subscription_data,
-        metadata: {
-          ...(paramsOverrides.subscription_data?.metadata ?? {}),
-          ...(sessionParams.subscription_data?.metadata ?? {}),
-        },
-      };
-    }
-    if (sessionParams.payment_intent_data || paramsOverrides.payment_intent_data) {
-      finalParams.payment_intent_data = {
-        ...sessionParams.payment_intent_data,
-        ...paramsOverrides.payment_intent_data,
-        metadata: {
-          ...(paramsOverrides.payment_intent_data?.metadata ?? {}),
-          ...(sessionParams.payment_intent_data?.metadata ?? {}),
-        },
-      };
-    }
-    if (isNonHostedCheckoutUiMode(finalParams.ui_mode)) {
-      delete finalParams.success_url;
-      delete finalParams.cancel_url;
-    }
-
-    const session = await stripe.checkout.sessions.create(finalParams);
-
-    return {
-      sessionId: session.id,
-      url: session.url,
-    };
-  }
-
-  /**
-   * Create a new Stripe customer.
-   *
-   * @param args.idempotencyKey - Optional key to prevent duplicate customer creation.
-   *   If two requests come in with the same key, Stripe returns the same customer.
-   *   Recommended: pass `userId` to prevent race conditions.
+   * Create a CIM customer profile and store it.
+   * `userId` is kept in Convex metadata. Authorize.net's merchantCustomerId
+   * field is limited to 20 characters and cannot hold a typical auth subject.
    */
   async createCustomer(
     ctx: ActionCtx,
@@ -282,42 +175,21 @@ export class StripeSubscriptions {
       email?: string;
       name?: string;
       metadata?: Record<string, string>;
-      idempotencyKey?: string;
     },
   ) {
-    const stripe = this.stripe();
-
-    // Use idempotency key to prevent duplicate customers from race conditions
-    const requestOptions = args.idempotencyKey
-      ? { idempotencyKey: `create_customer_${args.idempotencyKey}` }
-      : undefined;
-
-    const customer = await stripe.customers.create(
-      {
-        email: args.email,
-        name: args.name,
-        metadata: args.metadata,
-      },
-      requestOptions,
-    );
-
-    // Store in our database
+    const customerProfileId = await this.gateway().createCustomerProfile({
+      email: args.email,
+      description: args.name,
+    });
     await ctx.runMutation(this.component.public.createOrUpdateCustomer, {
-      stripeCustomerId: customer.id,
+      customerProfileId,
       email: args.email,
       name: args.name,
       metadata: args.metadata,
     });
-
-    return {
-      customerId: customer.id,
-    };
+    return { customerId: customerProfileId };
   }
 
-  /**
-   * Get or create a Stripe customer for a user.
-   * Checks existing customers, subscriptions, and payments to avoid duplicates.
-   */
   async getOrCreateCustomer(
     ctx: ActionCtx,
     args: {
@@ -326,448 +198,684 @@ export class StripeSubscriptions {
       name?: string;
     },
   ) {
-    // Check the customers table directly by userId (uses by_user_id index)
     const existingByUserId = await ctx.runQuery(
       this.component.public.getCustomerByUserId,
       { userId: args.userId },
     );
     if (existingByUserId) {
-      return {
-        customerId: existingByUserId.stripeCustomerId,
-        isNew: false,
-      };
+      return { customerId: existingByUserId.customerProfileId, isNew: false };
     }
 
-    // Fallback: check by email (uses by_email index)
     if (args.email) {
       const existingByEmail = await ctx.runQuery(
         this.component.public.getCustomerByEmail,
         { email: args.email },
       );
       if (existingByEmail) {
-        return {
-          customerId: existingByEmail.stripeCustomerId,
-          isNew: false,
-        };
+        return { customerId: existingByEmail.customerProfileId, isNew: false };
       }
     }
 
-    // Check if customer exists by userId in subscriptions
     const existingSubs = await ctx.runQuery(
       this.component.public.listSubscriptionsByUserId,
       { userId: args.userId },
     );
-
     if (existingSubs.length > 0) {
-      return { customerId: existingSubs[0].stripeCustomerId, isNew: false };
+      return { customerId: existingSubs[0]!.customerProfileId, isNew: false };
     }
 
-    // Check existing payments
     const existingPayments = await ctx.runQuery(
       this.component.public.listPaymentsByUserId,
       { userId: args.userId },
     );
-
-    if (existingPayments.length > 0 && existingPayments[0].stripeCustomerId) {
-      return { customerId: existingPayments[0].stripeCustomerId, isNew: false };
+    if (existingPayments[0]?.customerProfileId) {
+      return {
+        customerId: existingPayments[0].customerProfileId,
+        isNew: false,
+      };
     }
 
-    // Create a new customer with idempotency key to prevent race conditions
-    const result = await this.createCustomer(ctx, {
+    const created = await this.createCustomer(ctx, {
       email: args.email,
       name: args.name,
       metadata: { userId: args.userId },
-      idempotencyKey: args.userId,
     });
-
-    return { customerId: result.customerId, isNew: true };
+    return { customerId: created.customerId, isNew: true };
   }
 
   /**
-   * Create a Stripe Customer Portal session for managing subscriptions.
+   * Start an Accept Hosted payment, or a hosted profile page when mode is `setup`.
+   * `amount` is the unit price in cents. The hosted form charges amount × quantity.
+   * Subscription checkout records the plan locally, then the payment webhook creates the ARB subscription.
    */
-  async createCustomerPortalSession(
+  async createHostedCheckout(
     ctx: ActionCtx,
+    args: {
+      mode: "payment" | "subscription" | "setup";
+      customerId?: string;
+      successUrl: string;
+      cancelUrl: string;
+      amount?: number;
+      quantity?: number;
+      planKey?: string;
+      interval?: BillingInterval;
+      metadata?: Record<string, string>;
+      subscriptionMetadata?: Record<string, string>;
+    },
+  ) {
+    const quantity = args.quantity ?? 1;
+    const metadata = {
+      ...(args.metadata ?? {}),
+      ...(args.mode === "subscription" ? (args.subscriptionMetadata ?? {}) : {}),
+    };
+    const checkoutId = createCheckoutId();
+    const gateway = this.gateway();
+
+    if (args.mode === "setup") {
+      if (!args.customerId) {
+        throw new Error("A customer profile is required to save a payment method");
+      }
+      await ctx.runMutation(this.component.private.insertCheckoutSession, {
+        checkoutId,
+        customerProfileId: args.customerId,
+        mode: "setup",
+        amount: 0,
+        quantity: 1,
+        metadata,
+      });
+      const token = await gateway.getHostedProfilePage({
+        customerProfileId: args.customerId,
+        returnUrl: args.successUrl,
+      });
+      return {
+        checkoutId,
+        token,
+        formUrl: gateway.endpoints.profileForm,
+      };
+    }
+
+    if (args.amount === undefined || !Number.isInteger(args.amount) || args.amount < 0) {
+      throw new Error("amount must be a non-negative integer number of cents");
+    }
+    if (!Number.isInteger(quantity) || quantity < 1) {
+      throw new Error("quantity must be a positive integer");
+    }
+    if (args.mode === "subscription") {
+      if (!args.interval || !Number.isInteger(args.interval.length) || args.interval.length < 1) {
+        throw new Error("interval is required for subscription checkout");
+      }
+    }
+
+    await ctx.runMutation(this.component.private.insertCheckoutSession, {
+      checkoutId,
+      customerProfileId: args.customerId,
+      mode: args.mode,
+      amount: args.amount,
+      quantity,
+      planKey: args.planKey,
+      intervalLength: args.interval?.length,
+      intervalUnit: args.interval?.unit,
+      metadata,
+    });
+
+    const token = await gateway.getHostedPaymentPage({
+      amount: centsToDollars(args.amount * quantity),
+      invoiceNumber: checkoutId,
+      description: args.planKey,
+      customerProfileId: args.customerId,
+      successUrl: args.successUrl,
+      cancelUrl: args.cancelUrl,
+    });
+
+    return {
+      checkoutId,
+      token,
+      formUrl: gateway.endpoints.paymentForm,
+    };
+  }
+
+  async createHostedProfilePage(
+    _ctx: ActionCtx,
     args: {
       customerId: string;
       returnUrl: string;
     },
   ) {
-    const stripe = this.stripe();
-
-    const session = await stripe.billingPortal.sessions.create({
-      customer: args.customerId,
-      return_url: args.returnUrl,
+    const gateway = this.gateway();
+    const token = await gateway.getHostedProfilePage({
+      customerProfileId: args.customerId,
+      returnUrl: args.returnUrl,
     });
-
     return {
-      url: session.url,
+      token,
+      formUrl: gateway.endpoints.profileForm,
     };
   }
 
-  // ============================================================================
-  // WEBHOOK REGISTRATION
-  // ============================================================================
+  /**
+   * Cancel immediately, or stop future ARB billings after the current cycle.
+   * ARB has no cancel-at-period-end flag. Period-end cancel sets totalOccurrences
+   * to the number of payments already collected and records the flag locally.
+   */
+  async cancelSubscription(
+    ctx: ActionCtx,
+    args: {
+      subscriptionId: string;
+      cancelAtPeriodEnd?: boolean;
+    },
+  ) {
+    const cancelAtPeriodEnd = args.cancelAtPeriodEnd ?? true;
+    const gateway = this.gateway();
+    const remote = await gateway.getSubscription(args.subscriptionId);
+    const local = await ctx.runQuery(this.component.public.getSubscription, {
+      subscriptionId: args.subscriptionId,
+    });
+
+    if (!cancelAtPeriodEnd) {
+      await gateway.cancelSubscription(args.subscriptionId);
+      await syncSubscriptionRecord(ctx, this.component, remote, {
+        status: "canceled",
+        cancelAtPeriodEnd: false,
+        customerProfileId: remote.customerProfileId ?? local?.customerProfileId,
+        unitAmount: local?.unitAmount,
+        quantity: local?.quantity,
+        planKey: local?.planKey ?? remote.name,
+        metadata: local?.metadata,
+      });
+      return null;
+    }
+
+    await gateway.updateSubscription(args.subscriptionId, {
+      totalOccurrences: remote.completedPayments,
+    });
+    const periodEnd = local?.currentPeriodEnd || currentPeriodEndUnix(remote);
+    await syncSubscriptionRecord(ctx, this.component, remote, {
+      status: "active",
+      cancelAtPeriodEnd: true,
+      cancelAt: periodEnd,
+      currentPeriodEnd: periodEnd,
+      customerProfileId: remote.customerProfileId ?? local?.customerProfileId,
+      unitAmount: local?.unitAmount,
+      quantity: local?.quantity,
+      planKey: local?.planKey ?? remote.name,
+      metadata: local?.metadata,
+    });
+    return null;
+  }
+
+  /**
+   * Undo a period-end cancel by restoring an open-ended occurrence count.
+   * This only works before Authorize.net has actually ended the subscription.
+   */
+  async reactivateSubscription(
+    ctx: ActionCtx,
+    args: {
+      subscriptionId: string;
+    },
+  ) {
+    const local = await ctx.runQuery(this.component.public.getSubscription, {
+      subscriptionId: args.subscriptionId,
+    });
+    if (!local) throw new Error("Subscription not found");
+    if (!local.cancelAtPeriodEnd) {
+      throw new Error("Subscription is not set to cancel");
+    }
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (local.status === "canceled" && (local.cancelAt ?? 0) <= nowSeconds) {
+      throw new Error("Subscription has already ended");
+    }
+
+    const gateway = this.gateway();
+    const remote = await gateway.getSubscription(args.subscriptionId);
+    if (mapSubscriptionStatus(remote.status) === "canceled") {
+      throw new Error("Subscription has already ended");
+    }
+    await gateway.updateSubscription(args.subscriptionId, {
+      totalOccurrences: OPEN_ENDED_OCCURRENCES,
+    });
+    await syncSubscriptionRecord(ctx, this.component, remote, {
+      status: "active",
+      cancelAtPeriodEnd: false,
+      customerProfileId: remote.customerProfileId ?? local.customerProfileId,
+      unitAmount: local.unitAmount,
+      quantity: local.quantity,
+      planKey: local.planKey,
+      currentPeriodEnd: local.currentPeriodEnd,
+      metadata: local.metadata,
+    });
+    return null;
+  }
+
+  /**
+   * Seat changes bill unitAmount × quantity. ARB stores a single amount and
+   * cannot change the billing interval after creation.
+   */
+  async updateSubscriptionQuantity(
+    ctx: ActionCtx,
+    args: {
+      subscriptionId: string;
+      quantity: number;
+    },
+  ) {
+    if (!Number.isInteger(args.quantity) || args.quantity < 1) {
+      throw new Error("quantity must be a positive integer");
+    }
+    const local = await ctx.runQuery(this.component.public.getSubscription, {
+      subscriptionId: args.subscriptionId,
+    });
+    if (!local) throw new Error("Subscription not found");
+
+    const amount = local.unitAmount * args.quantity;
+    await this.gateway().updateSubscription(args.subscriptionId, {
+      amount: centsToDollars(amount),
+    });
+    await ctx.runMutation(this.component.private.updateSubscriptionQuantityInternal, {
+      subscriptionId: args.subscriptionId,
+      quantity: args.quantity,
+      amount,
+    });
+    return null;
+  }
 }
+
+async function syncCustomer(
+  ctx: ActionCtx,
+  component: AuthorizeNetComponent,
+  profile: GatewayCustomer,
+) {
+  await ctx.runMutation(component.public.createOrUpdateCustomer, {
+    customerProfileId: profile.customerProfileId,
+    email: profile.email,
+    name: profile.description,
+  });
+  for (const [index, paymentProfile] of profile.paymentProfiles.entries()) {
+    await ctx.runMutation(component.private.upsertPaymentProfile, {
+      customerProfileId: profile.customerProfileId,
+      customerPaymentProfileId: paymentProfile.customerPaymentProfileId,
+      brand: paymentProfile.brand,
+      last4: paymentProfile.last4,
+      isDefault: index === 0,
+    });
+  }
+}
+
+async function syncSubscriptionRecord(
+  ctx: ActionCtx,
+  component: AuthorizeNetComponent,
+  remote: GatewaySubscription,
+  overrides: {
+    status: string;
+    cancelAtPeriodEnd?: boolean;
+    cancelAt?: number;
+    currentPeriodEnd?: number;
+    customerProfileId?: string;
+    customerPaymentProfileId?: string;
+    unitAmount?: number;
+    quantity?: number;
+    planKey?: string;
+    metadata?: Record<string, unknown>;
+  },
+) {
+  await ctx.runMutation(component.private.handleSubscriptionUpsert, {
+    subscriptionId: remote.subscriptionId,
+    customerProfileId: overrides.customerProfileId ?? remote.customerProfileId,
+    customerPaymentProfileId:
+      overrides.customerPaymentProfileId ?? remote.customerPaymentProfileId,
+    status: overrides.status,
+    amount: remote.amountCents,
+    unitAmount: overrides.unitAmount,
+    quantity: overrides.quantity,
+    intervalLength: remote.intervalLength,
+    intervalUnit: remote.intervalUnit,
+    planKey: overrides.planKey ?? remote.name,
+    currentPeriodEnd: overrides.currentPeriodEnd ?? currentPeriodEndUnix(remote),
+    cancelAtPeriodEnd: overrides.cancelAtPeriodEnd,
+    cancelAt: overrides.cancelAt,
+    metadata: overrides.metadata,
+  });
+}
+
+async function handleCustomerEvent(
+  ctx: ActionCtx,
+  component: AuthorizeNetComponent,
+  event: AuthorizeNetNotification,
+  gateway: AuthorizeNetClient,
+) {
+  const id = String(event.payload.id);
+  if (event.eventType.endsWith(".deleted") && !event.eventType.includes("paymentProfile")) {
+    await ctx.runMutation(component.private.handleCustomerDeleted, {
+      customerProfileId: id,
+    });
+    return;
+  }
+  const customerProfileId = String(event.payload.customerProfileId ?? id);
+  const profile = await gateway.getCustomerProfile(customerProfileId);
+  await syncCustomer(ctx, component, profile);
+}
+
+async function handlePaymentProfileEvent(
+  ctx: ActionCtx,
+  component: AuthorizeNetComponent,
+  event: AuthorizeNetNotification,
+  gateway: AuthorizeNetClient,
+) {
+  if (event.eventType.endsWith(".deleted")) {
+    await ctx.runMutation(component.private.handlePaymentProfileDeleted, {
+      customerPaymentProfileId: String(event.payload.id),
+    });
+    return;
+  }
+  if (event.payload.customerProfileId === undefined) {
+    throw new Error("Payment profile webhook is missing customerProfileId");
+  }
+  const profile = await gateway.getCustomerProfile(
+    String(event.payload.customerProfileId),
+  );
+  await syncCustomer(ctx, component, profile);
+}
+
+async function handleSubscriptionEvent(
+  ctx: ActionCtx,
+  component: AuthorizeNetComponent,
+  event: AuthorizeNetNotification,
+  gateway: AuthorizeNetClient,
+) {
+  const subscriptionId = String(event.payload.id);
+  const remote = await gateway.getSubscription(subscriptionId);
+  const local = (await ctx.runQuery(component.public.getSubscription, {
+    subscriptionId: remote.subscriptionId,
+  })) as StoredSubscription | null;
+  const failed = event.eventType.endsWith(".failed");
+  await syncSubscriptionRecord(ctx, component, remote, {
+    status: mapSubscriptionStatus(remote.status, failed),
+    customerProfileId: remote.customerProfileId ?? local?.customerProfileId,
+    metadata: local?.metadata,
+    unitAmount: local?.unitAmount,
+    quantity: local?.quantity,
+    planKey: local?.planKey ?? remote.name,
+  });
+
+  const customerProfileId = remote.customerProfileId ?? local?.customerProfileId;
+  if (failed && remote.latestTransId && customerProfileId) {
+    const created = createdUnix(undefined, event.eventDate);
+    await ctx.runMutation(component.private.handleInvoiceUpsert, {
+      transId: remote.latestTransId,
+      customerProfileId,
+      subscriptionId: remote.subscriptionId,
+      status: "failed",
+      amountDue: remote.amountCents,
+      amountPaid: 0,
+      created,
+      metadata: local?.metadata,
+    });
+  }
+}
+
+async function handlePaymentEvent(
+  ctx: ActionCtx,
+  component: AuthorizeNetComponent,
+  event: AuthorizeNetNotification,
+  gateway: AuthorizeNetClient,
+  currency: string,
+) {
+  const transaction = await gateway.getTransactionDetails(String(event.payload.id));
+  const status = paymentStatusFromEvent(
+    event.eventType,
+    transaction.responseCode ?? event.payload.responseCode,
+  );
+  const checkout = transaction.invoiceNumber
+    ? ((await ctx.runQuery(component.public.getCheckoutSession, {
+        checkoutId: transaction.invoiceNumber,
+      })) as CheckoutSession | null)
+    : null;
+
+  let metadata = checkout?.metadata;
+  if (!metadata && transaction.subscriptionId) {
+    const linked = (await ctx.runQuery(component.public.getSubscription, {
+      subscriptionId: transaction.subscriptionId,
+    })) as StoredSubscription | null;
+    metadata = linked?.metadata;
+  }
+
+  const created = createdUnix(transaction.submitTimeUTC, event.eventDate);
+  await ctx.runMutation(component.private.handlePaymentUpsert, {
+    transId: transaction.transId,
+    refTransId: transaction.refTransId,
+    customerProfileId: transaction.customerProfileId,
+    subscriptionId: transaction.subscriptionId,
+    amount: transaction.amountCents,
+    currency,
+    status,
+    created,
+    metadata,
+  });
+
+  if (transaction.customerProfileId && transaction.customerPaymentProfileId) {
+    await ctx.runMutation(component.private.upsertPaymentProfile, {
+      customerProfileId: transaction.customerProfileId,
+      customerPaymentProfileId: transaction.customerPaymentProfileId,
+      brand: transaction.cardType,
+      last4: transaction.last4,
+      isDefault: true,
+    });
+  }
+
+  let subscriptionId = transaction.subscriptionId ?? checkout?.subscriptionId;
+  if (
+    checkout &&
+    checkout.status === "open" &&
+    checkout.mode === "subscription" &&
+    !checkout.subscriptionId &&
+    status === "succeeded" &&
+    transaction.customerProfileId &&
+    transaction.customerPaymentProfileId &&
+    checkout.intervalLength &&
+    checkout.intervalUnit
+  ) {
+    const interval = {
+      length: checkout.intervalLength,
+      unit: checkout.intervalUnit,
+    };
+    const startDate = addInterval(new Date(), interval);
+    subscriptionId = await gateway.createSubscription({
+      name: checkout.planKey || "Subscription",
+      amount: centsToDollars(checkout.amount * checkout.quantity),
+      intervalLength: interval.length,
+      intervalUnit: interval.unit,
+      startDate,
+      customerProfileId: transaction.customerProfileId,
+      customerPaymentProfileId: transaction.customerPaymentProfileId,
+      invoiceNumber: checkout.checkoutId,
+      description: checkout.planKey,
+    });
+    await ctx.runMutation(component.private.handleSubscriptionUpsert, {
+      subscriptionId,
+      customerProfileId: transaction.customerProfileId,
+      customerPaymentProfileId: transaction.customerPaymentProfileId,
+      status: "active",
+      amount: checkout.amount * checkout.quantity,
+      unitAmount: checkout.amount,
+      quantity: checkout.quantity,
+      intervalLength: interval.length,
+      intervalUnit: interval.unit,
+      planKey: checkout.planKey ?? "",
+      currentPeriodEnd: currentPeriodEndUnix({
+        startDate,
+        intervalLength: interval.length,
+        intervalUnit: interval.unit,
+      }),
+      cancelAtPeriodEnd: false,
+      metadata: checkout.metadata,
+    });
+  }
+
+  if (checkout && checkout.status === "open" && status === "succeeded") {
+    await ctx.runMutation(component.private.handleCheckoutCompleted, {
+      checkoutId: checkout.checkoutId,
+      customerProfileId: transaction.customerProfileId ?? checkout.customerProfileId,
+      subscriptionId,
+    });
+  }
+
+  const customerProfileId = transaction.customerProfileId ?? checkout?.customerProfileId;
+  const invoiceSubscriptionId = subscriptionId;
+  const isSubscriptionCharge =
+    Boolean(invoiceSubscriptionId) &&
+    (checkout?.mode === "subscription" || Boolean(transaction.subscriptionId));
+  if (
+    isSubscriptionCharge &&
+    customerProfileId &&
+    invoiceSubscriptionId &&
+    (status === "succeeded" || status === "failed")
+  ) {
+    const invoiceStatus =
+      status === "succeeded" ? "paid" : status === "failed" ? "failed" : "open";
+    await ctx.runMutation(component.private.handleInvoiceUpsert, {
+      transId: transaction.transId,
+      customerProfileId,
+      subscriptionId: invoiceSubscriptionId,
+      status: invoiceStatus,
+      amountDue: transaction.amountCents,
+      amountPaid: invoiceStatus === "paid" ? transaction.amountCents : 0,
+      created,
+      metadata,
+    });
+  }
+}
+
 /**
- * Register webhook routes with the HTTP router.
- * This simplifies webhook setup by handling signature verification
- * and routing events to the appropriate handlers automatically.
- *
- * @param http - The HTTP router instance
- * @param config - Optional configuration for webhook path and event handlers
- *
- * @example
- * ```typescript
- * // convex/http.ts
- * import { httpRouter } from "convex/server";
- * import { stripe } from "./stripe";
- *
- * const http = httpRouter();
- *
- * stripe.registerRoutes(http, {
- *   events: {
- *     "customer.subscription.updated": async (ctx, event) => {
- *       // Your custom logic after default handling
- *       console.log("Subscription updated:", event.data.object);
- *     },
- *   },
- * });
- *
- * export default http;
- * ```
+ * Apply an Authorize.net webhook notification to the component tables.
+ * Notifications only carry an id, so this reads the customer, subscription, or
+ * transaction before writing. A repeated notificationId is ignored.
  */
+export async function processEvent(
+  ctx: ActionCtx,
+  component: AuthorizeNetComponent,
+  event: AuthorizeNetNotification,
+  gateway: AuthorizeNetClient,
+  options?: { currency?: string },
+): Promise<void> {
+  const claimed = await ctx.runMutation(component.private.claimWebhookNotification, {
+    notificationId: event.notificationId,
+    eventType: event.eventType,
+  });
+  if (!claimed) return;
+
+  try {
+    if (event.eventType.includes(".paymentProfile.")) {
+      await handlePaymentProfileEvent(ctx, component, event, gateway);
+    } else if (event.eventType.includes(".subscription.")) {
+      await handleSubscriptionEvent(ctx, component, event, gateway);
+    } else if (event.eventType.startsWith("net.authorize.customer.")) {
+      await handleCustomerEvent(ctx, component, event, gateway);
+    } else if (event.eventType.startsWith("net.authorize.payment.")) {
+      await handlePaymentEvent(
+        ctx,
+        component,
+        event,
+        gateway,
+        options?.currency ?? "usd",
+      );
+    } else {
+      console.log(`Unhandled Authorize.net event: ${event.eventType}`);
+    }
+  } catch (error) {
+    await ctx.runMutation(component.private.releaseWebhookNotification, {
+      notificationId: event.notificationId,
+    });
+    throw error;
+  }
+}
+
+export async function handleWebhookRequest(
+  ctx: ActionCtx,
+  component: AuthorizeNetComponent,
+  req: Request,
+  config?: RegisterRoutesConfig,
+): Promise<Response> {
+  const credentials = credentialsFrom(config);
+  if (!credentials.signatureKey) {
+    console.error("AUTHORIZENET_SIGNATURE_KEY is not set");
+    return new Response("Webhook signature key not configured", { status: 500 });
+  }
+  const apiCredentials = (() => {
+    try {
+      return requireApiCredentials(credentials);
+    } catch (error) {
+      console.error(error);
+      return undefined;
+    }
+  })();
+  if (!apiCredentials) {
+    return new Response("Authorize.net API credentials are not configured", {
+      status: 500,
+    });
+  }
+
+  const signature = req.headers.get("X-ANET-Signature");
+  if (!signature) {
+    console.error("No Authorize.net signature in headers");
+    return new Response("No signature provided", { status: 400 });
+  }
+
+  const body = await req.text();
+  const valid = await verifyWebhookSignature(body, signature, credentials.signatureKey);
+  if (!valid) {
+    console.error("Webhook signature verification failed");
+    return new Response("Webhook signature verification failed", { status: 400 });
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return new Response("Invalid webhook payload", { status: 400 });
+  }
+  if (!isNotification(parsed)) {
+    return new Response("Invalid webhook payload", { status: 400 });
+  }
+
+  const gateway = new AuthorizeNetClient(
+    apiCredentials.apiLoginId,
+    apiCredentials.transactionKey,
+    credentials.environment,
+  );
+
+  try {
+    await processEvent(ctx, component, parsed, gateway, {
+      currency: credentials.currency,
+    });
+    if (config?.onEvent) {
+      await config.onEvent(ctx, parsed);
+    }
+    const customHandler = config?.events?.[parsed.eventType];
+    if (customHandler) {
+      await customHandler(ctx, parsed);
+    }
+  } catch (error) {
+    console.error("Error processing webhook", error);
+    return new Response("Error processing webhook", { status: 500 });
+  }
+
+  return new Response(JSON.stringify({ received: true }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
 export function registerRoutes(
   http: HttpRouter,
-  component: ComponentApi,
+  component: AuthorizeNetComponent,
   config?: RegisterRoutesConfig,
 ) {
-  const webhookPath = config?.webhookPath ?? "/stripe/webhook";
-  const eventHandlers = config?.events ?? {};
-
+  const webhookPath = config?.webhookPath ?? "/authorizenet/webhook";
   http.route({
     path: webhookPath,
     method: "POST",
     handler: httpActionGeneric(async (ctx, req) => {
-      const webhookSecret =
-        config?.STRIPE_WEBHOOK_SECRET || process.env.STRIPE_WEBHOOK_SECRET;
-
-      if (!webhookSecret) {
-        console.error("❌ STRIPE_WEBHOOK_SECRET is not set");
-        return new Response("Webhook secret not configured", { status: 500 });
-      }
-
-      const signature = req.headers.get("stripe-signature");
-      if (!signature) {
-        console.error("❌ No Stripe signature in headers");
-        return new Response("No signature provided", { status: 400 });
-      }
-
-      const body = await req.text();
-
-      const apiKey = config?.STRIPE_SECRET_KEY || process.env.STRIPE_SECRET_KEY;
-
-      if (!apiKey) {
-        console.error("❌ STRIPE_SECRET_KEY is not set");
-        return new Response("Stripe secret key not configured", {
-          status: 500,
-        });
-      }
-
-      const stripe = new StripeSDK(
-        apiKey,
-        config?.apiVersion
-          ? ({ apiVersion: config.apiVersion } as StripeClientConfig)
-          : undefined,
-      );
-
-      // Verify webhook signature
-      let event: StripeSDK.Event;
-      try {
-        event = await stripe.webhooks.constructEventAsync(
-          body,
-          signature,
-          webhookSecret,
-        );
-      } catch (err) {
-        console.error("❌ Webhook signature verification failed:", err);
-        return new Response(
-          `Webhook signature verification failed: ${err instanceof Error ? err.message : String(err)}`,
-          { status: 400 },
-        );
-      }
-
-      // Process the event with default handlers
-      try {
-        await processEvent(ctx, component, event, stripe);
-
-        // Call generic event handler if provided
-        if (config?.onEvent) {
-          await config.onEvent(ctx, event);
-        }
-
-        // Call custom event handler if provided
-        const eventType = event.type;
-        const customHandler:
-          | ((ctx: any, event: any) => Promise<void>)
-          | undefined = eventHandlers[eventType] as any;
-        if (customHandler) {
-          await customHandler(ctx, event);
-        }
-      } catch (error) {
-        console.error("❌ Error processing webhook:", error);
-        return new Response("Error processing webhook", { status: 500 });
-      }
-
-      return new Response(JSON.stringify({ received: true }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      });
+      return await handleWebhookRequest(ctx, component, req, config);
     }),
   });
 }
 
-/**
- * Internal method to process Stripe webhook events with default handling.
- * This handles the database syncing for all supported event types.
- */
-export async function processEvent(
-  ctx: MutationCtx | ActionCtx,
-  component: ComponentApi,
-  event: StripeSDK.Event,
-  stripe: StripeSDK,
-): Promise<void> {
-  switch (event.type) {
-    case "customer.created":
-    case "customer.updated": {
-      const customer = event.data.object as StripeSDK.Customer;
-      const handler =
-        event.type === "customer.created"
-          ? component.private.handleCustomerCreated
-          : component.private.handleCustomerUpdated;
-
-      await ctx.runMutation(handler, {
-        stripeCustomerId: customer.id,
-        email: customer.email || undefined,
-        name: customer.name || undefined,
-        metadata: customer.metadata,
-      });
-      break;
-    }
-
-    case "customer.deleted": {
-      const customer = event.data.object as StripeSDK.Customer;
-      await ctx.runMutation(component.private.handleCustomerDeleted, {
-        stripeCustomerId: customer.id,
-      });
-      break;
-    }
-
-    case "customer.subscription.created": {
-      const subscription = event.data.object as StripeSDK.Subscription;
-      const item = subscription.items.data[0];
-
-      await ctx.runMutation(component.private.handleSubscriptionCreated, {
-        stripeSubscriptionId: subscription.id,
-        stripeCustomerId: subscription.customer as string,
-        status: subscription.status,
-        currentPeriodEnd: item?.current_period_end || 0,
-        cancelAtPeriodEnd: subscription.cancel_at_period_end ?? false,
-        cancelAt: subscription.cancel_at ?? undefined,
-        quantity: subscription.items.data[0]?.quantity ?? 1,
-        priceId: item?.price?.id || "",
-        metadata: subscription.metadata || {},
-      });
-      break;
-    }
-
-    case "customer.subscription.updated": {
-      const subscription = event.data.object as StripeSDK.Subscription;
-      const item = subscription.items.data[0];
-
-      await ctx.runMutation(component.private.handleSubscriptionUpdated, {
-        stripeSubscriptionId: subscription.id,
-        stripeCustomerId: subscription.customer as string,
-        status: subscription.status,
-        currentPeriodEnd: item?.current_period_end || 0,
-        cancelAtPeriodEnd: subscription.cancel_at_period_end ?? false,
-        cancelAt: subscription.cancel_at ?? undefined,
-        quantity: subscription.items.data[0]?.quantity ?? 1,
-        priceId: item?.price?.id || undefined,
-        metadata: subscription.metadata || {},
-      });
-      break;
-    }
-
-    case "customer.subscription.deleted": {
-      const subscription = event.data.object as StripeSDK.Subscription;
-      const item = subscription.items.data[0];
-      await ctx.runMutation(component.private.handleSubscriptionDeleted, {
-        stripeSubscriptionId: subscription.id,
-        cancelAtPeriodEnd: subscription.cancel_at_period_end ?? false,
-        currentPeriodEnd: item?.current_period_end ?? undefined,
-        cancelAt: subscription.cancel_at ?? undefined,
-      });
-      break;
-    }
-
-    case "checkout.session.completed": {
-      const session = event.data.object as StripeSDK.Checkout.Session;
-      await ctx.runMutation(component.private.handleCheckoutSessionCompleted, {
-        stripeCheckoutSessionId: session.id,
-        stripeCustomerId: session.customer
-          ? (session.customer as string)
-          : undefined,
-        mode: session.mode || "payment",
-        metadata: session.metadata || undefined,
-      });
-
-      // For payment mode, link the payment to the customer if we have both
-      if (
-        session.mode === "payment" &&
-        session.customer &&
-        session.payment_intent
-      ) {
-        await ctx.runMutation(component.private.updatePaymentCustomer, {
-          stripePaymentIntentId: session.payment_intent as string,
-          stripeCustomerId: session.customer as string,
-        });
-      }
-
-      // For subscription mode, fetch and store the latest invoice
-      if (session.mode === "subscription" && session.subscription) {
-        try {
-          const subscription = await stripe.subscriptions.retrieve(
-            session.subscription as string,
-          );
-          if (subscription.latest_invoice) {
-            const invoice = await stripe.invoices.retrieve(
-              subscription.latest_invoice as string,
-            );
-            await ctx.runMutation(component.private.handleInvoiceCreated, {
-              stripeInvoiceId: invoice.id,
-              stripeCustomerId: invoice.customer as string,
-              stripeSubscriptionId: subscription.id,
-              status: invoice.status || "paid",
-              amountDue: invoice.amount_due,
-              amountPaid: invoice.amount_paid,
-              created: invoice.created,
-              metadata: getInvoiceMetadata(invoice),
-            });
-          }
-        } catch (err) {
-          console.error("Error fetching invoice for subscription:", err);
-        }
-      }
-      break;
-    }
-
-    case "invoice.created":
-    case "invoice.finalized":
-    case "invoice.updated":
-    case "invoice.paid":
-    case "invoice.payment_succeeded": {
-      const invoice = event.data.object as StripeSDK.Invoice;
-      await ctx.runMutation(component.private.handleInvoiceCreated, {
-        stripeInvoiceId: invoice.id,
-        stripeCustomerId: invoice.customer as string,
-        stripeSubscriptionId: getInvoiceSubscriptionId(invoice),
-        status: invoice.status || "open",
-        amountDue: invoice.amount_due,
-        amountPaid: invoice.amount_paid,
-        created: invoice.created,
-        metadata: getInvoiceMetadata(invoice),
-      });
-      break;
-    }
-
-    case "invoice.payment_failed": {
-      const invoice = event.data.object as StripeSDK.Invoice;
-      await ctx.runMutation(component.private.handleInvoicePaymentFailed, {
-        stripeInvoiceId: invoice.id,
-      });
-      break;
-    }
-
-    case "payment_intent.succeeded": {
-      const paymentIntent = event.data.object as any;
-
-      // Check if this is a subscription payment
-      if (paymentIntent.invoice) {
-        try {
-          const invoice = await stripe.invoices.retrieve(
-            paymentIntent.invoice as string,
-          );
-          if (getInvoiceSubscriptionId(invoice)) {
-            console.log(
-              "⏭️ Skipping payment_intent.succeeded - subscription payment",
-            );
-            break;
-          }
-        } catch (err) {
-          console.error("Error checking invoice:", err);
-        }
-      }
-
-      await ctx.runMutation(component.private.handlePaymentIntentSucceeded, {
-        stripePaymentIntentId: paymentIntent.id,
-        stripeCustomerId: paymentIntent.customer
-          ? (paymentIntent.customer as string)
-          : undefined,
-        amount: paymentIntent.amount,
-        currency: paymentIntent.currency,
-        status: paymentIntent.status,
-        created: paymentIntent.created,
-        metadata: paymentIntent.metadata || {},
-      });
-      break;
-    }
-
-    default:
-      console.log(`ℹ️ Unhandled event type: ${event.type}`);
-  }
-}
-
-function getInvoiceSubscriptionId(invoice: StripeSDK.Invoice) {
-  const parentSubscription = invoice.parent?.subscription_details?.subscription;
-  if (typeof parentSubscription === "string") {
-    return parentSubscription;
-  }
-  if (parentSubscription && "id" in parentSubscription) {
-    return parentSubscription.id;
-  }
-
-  const legacySubscription = (
-    invoice as StripeSDK.Invoice & {
-      subscription?: string | StripeSDK.Subscription | null;
-    }
-  ).subscription;
-  if (typeof legacySubscription === "string") {
-    return legacySubscription;
-  }
-  if (legacySubscription && "id" in legacySubscription) {
-    return legacySubscription.id;
-  }
-  return undefined;
-}
-
-function getStripeObjectId(object: string | { id: string }) {
-  return typeof object === "string" ? object : object.id;
-}
-
-function getInvoiceMetadata(invoice: StripeSDK.Invoice) {
-  const invoiceMetadata = invoice.metadata || {};
-  if (Object.keys(invoiceMetadata).length > 0) {
-    return invoiceMetadata;
-  }
-  return invoice.parent?.subscription_details?.metadata || {};
-}
-
-function isNonHostedCheckoutUiMode(
-  uiMode: StripeSDK.Checkout.SessionCreateParams.UiMode | undefined,
-) {
-  const value = uiMode as string | undefined;
-  return value !== undefined && value !== "hosted_page" && value !== "hosted";
-}
-
-export default StripeSubscriptions;
+export default AuthorizeNet;

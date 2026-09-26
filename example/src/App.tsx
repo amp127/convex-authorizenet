@@ -1,5 +1,6 @@
 import "./App.css";
 import { SignInButton, SignOutButton, useUser } from "@clerk/clerk-react";
+import { submitHostedForm } from "@convex-dev/authorizenet/react";
 import { useAction, useQuery } from "convex/react";
 import { api } from "../convex/_generated/api";
 import { useState } from "react";
@@ -30,7 +31,10 @@ function getStatusBadge(status: string) {
     active: { label: "Active", class: "status-active" },
     canceled: { label: "Canceled", class: "status-canceled" },
     past_due: { label: "Past Due", class: "status-error" },
-    unpaid: { label: "Unpaid", class: "status-error" },
+    failed: { label: "Failed", class: "status-error" },
+    held: { label: "Held", class: "status-warning" },
+    refunded: { label: "Refunded", class: "status-canceled" },
+    voided: { label: "Voided", class: "status-canceled" },
     trialing: { label: "Trial", class: "status-info" },
     succeeded: { label: "Paid", class: "status-active" },
     pending: { label: "Pending", class: "status-warning" },
@@ -113,9 +117,9 @@ function Navbar({
 // ============================================================================
 function FailedPaymentBanner() {
   const failedSubscriptions = useQuery(
-    api.stripe.getFailedPaymentSubscriptions,
+    api.authorizenet.getFailedPaymentSubscriptions,
   );
-  const getPortalUrl = useAction(api.stripe.getCustomerPortalUrl);
+  const getPaymentProfilePage = useAction(api.authorizenet.getPaymentProfilePage);
   const [loading, setLoading] = useState(false);
 
   if (!failedSubscriptions || failedSubscriptions.length === 0) return null;
@@ -123,12 +127,12 @@ function FailedPaymentBanner() {
   const handleRetry = async () => {
     setLoading(true);
     try {
-      const result = await getPortalUrl({});
-      if (result?.url) {
-        window.location.href = result.url;
+      const result = await getPaymentProfilePage({});
+      if (result) {
+        submitHostedForm(result);
       }
     } catch (error) {
-      console.error("Error getting portal URL:", error);
+      console.error("Error opening payment profile page:", error);
     } finally {
       setLoading(false);
     }
@@ -159,14 +163,14 @@ function Hero({ setCurrentPage }: { setCurrentPage: (page: Page) => void }) {
     <section className="hero">
       <div className="hero-container">
         <div className="hero-content">
-          <div className="hero-badge">Stripe Component Demo</div>
+          <div className="hero-badge">Authorize.net Component Demo</div>
           <h1 className="hero-title">
             Premium hats,
             <br />
             <em>delivered monthly</em>
           </h1>
           <p className="hero-subtitle">
-            The perfect example app for testing the @convex-dev/stripe
+            The perfect example app for testing the @convex-dev/authorizenet
             component. Buy a single hat or subscribe for monthly deliveries.
           </p>
           <div className="hero-buttons">
@@ -178,7 +182,7 @@ function Hero({ setCurrentPage }: { setCurrentPage: (page: Page) => void }) {
               <span>→</span>
             </button>
             <a
-              href="https://github.com/get-convex/convex-stripe"
+              href="https://developer.authorize.net/"
               target="_blank"
               rel="noopener noreferrer"
               className="btn-secondary"
@@ -204,7 +208,7 @@ function Hero({ setCurrentPage }: { setCurrentPage: (page: Page) => void }) {
                 <span className="code-function">useAction</span>(
               </div>
               <div>
-                &nbsp;&nbsp;api.stripe.
+                &nbsp;&nbsp;api.authorizenet.
                 <span className="code-function">createPaymentCheckout</span>
               </div>
               <div>);</div>
@@ -218,7 +222,7 @@ function Hero({ setCurrentPage }: { setCurrentPage: (page: Page) => void }) {
                 <span className="code-function">useAction</span>(
               </div>
               <div>
-                &nbsp;&nbsp;api.stripe.
+                &nbsp;&nbsp;api.authorizenet.
                 <span className="code-function">
                   createSubscriptionCheckout
                 </span>
@@ -252,9 +256,9 @@ function Features() {
     },
     {
       icon: "💳",
-      title: "Stripe Powered",
+      title: "Authorize.net Powered",
       description:
-        "Secure payments via Stripe Checkout. Manage billing in the Customer Portal.",
+        "Secure payments via Accept Hosted. Manage saved cards on the hosted profile page.",
     },
     {
       icon: "⚡",
@@ -281,8 +285,8 @@ function Features() {
         <span className="section-badge">How It Works</span>
         <h2 className="section-title">Payments made simple</h2>
         <p className="section-subtitle">
-          Built with the @convex-dev/stripe component for seamless Stripe
-          integration.
+          Built with the @convex-dev/authorizenet component for Accept Hosted
+          checkout and Automated Recurring Billing.
         </p>
       </div>
       <div className="features-grid">
@@ -330,12 +334,12 @@ function Footer() {
             Convex Docs
           </a>
           <a
-            href="https://stripe.com/docs"
+            href="https://developer.authorize.net/"
             target="_blank"
             rel="noopener noreferrer"
             className="footer-link"
           >
-            Stripe Docs
+            Authorize.net Docs
           </a>
           <a
             href="https://clerk.com/docs"
@@ -347,7 +351,7 @@ function Footer() {
           </a>
         </div>
         <div className="footer-copyright">
-          Built with Convex + Stripe + Clerk
+          Built with Convex + Authorize.net + Clerk
         </div>
       </div>
     </footer>
@@ -373,18 +377,14 @@ function LandingPage({
 // STORE PAGE
 // ============================================================================
 
-// Price IDs from environment variables (set in .env.local)
-const STRIPE_ONE_TIME_PRICE_ID = import.meta.env.VITE_STRIPE_ONE_TIME_PRICE_ID;
-const STRIPE_SUBSCRIPTION_PRICE_ID = import.meta.env
-  .VITE_STRIPE_SUBSCRIPTION_PRICE_ID;
-
 const PRODUCTS = {
   oneTimeHat: {
     id: "one-time-hat",
     name: "Benji's Hat",
     description: "A premium, handcrafted hat. One-time purchase.",
     price: 49,
-    priceId: STRIPE_ONE_TIME_PRICE_ID,
+    amount: 4900,
+    planKey: "hat_onetime",
     type: "payment" as const,
     emoji: "🎩",
   },
@@ -394,11 +394,12 @@ const PRODUCTS = {
     description:
       "Get a new exclusive hat delivered every month. Cancel anytime.",
     price: 29,
-    priceId: STRIPE_SUBSCRIPTION_PRICE_ID,
+    amount: 2900,
+    planKey: "hat_monthly",
     type: "subscription" as const,
     emoji: "📦",
-    interval: "month",
-    // Note: For team/seat-based subscriptions, use the Team Billing page
+    intervalLength: 1,
+    intervalUnit: "months" as const,
   },
 };
 
@@ -452,9 +453,9 @@ function StorePage({
   const { isSignedIn, user } = useUser();
   const [loading, setLoading] = useState<string | null>(null);
 
-  const createPaymentCheckout = useAction(api.stripe.createPaymentCheckout);
+  const createPaymentCheckout = useAction(api.authorizenet.createPaymentCheckout);
   const createSubscriptionCheckout = useAction(
-    api.stripe.createSubscriptionCheckout,
+    api.authorizenet.createSubscriptionCheckout,
   );
 
   if (!isSignedIn) {
@@ -484,20 +485,23 @@ function StorePage({
     try {
       let result;
       if (product.type === "subscription") {
-        // User subscription - quantity 1
-        result = await createSubscriptionCheckout({ priceId: product.priceId });
+        result = await createSubscriptionCheckout({
+          amount: product.amount,
+          planKey: product.planKey,
+          intervalLength: product.intervalLength,
+          intervalUnit: product.intervalUnit,
+        });
       } else {
-        result = await createPaymentCheckout({ priceId: product.priceId });
+        result = await createPaymentCheckout({
+          amount: product.amount,
+          planKey: product.planKey,
+        });
       }
 
-      if (result.url) {
-        window.location.href = result.url;
-      }
+      submitHostedForm(result);
     } catch (error) {
       console.error("Checkout error:", error);
-      alert(
-        "Failed to create checkout session. Make sure your Stripe Price IDs are configured.",
-      );
+      alert("Failed to open the Authorize.net payment form.");
     } finally {
       setLoading(null);
     }
@@ -565,9 +569,9 @@ function StorePage({
         <div className="note-content">
           <strong>Testing the integration?</strong>
           <p>
-            Replace the <code>priceId</code> values in <code>App.tsx</code> with
-            your actual Stripe Price IDs. Use <code>4242 4242 4242 4242</code>{" "}
-            as a test card number.
+            Use the sandbox card <code>4111 1111 1111 1111</code> with any
+            future expiration date and any CVV. Amounts are set in{" "}
+            <code>App.tsx</code>.
           </p>
         </div>
       </div>
@@ -587,13 +591,13 @@ function ProfilePage({
   setCurrentPage: (page: Page) => void;
 }) {
   const { isSignedIn, user } = useUser();
-  const subscriptions = useQuery(api.stripe.getUserSubscriptions);
-  const payments = useQuery(api.stripe.getUserPayments);
-  const cancelSubscriptionAction = useAction(api.stripe.cancelSubscription);
+  const subscriptions = useQuery(api.authorizenet.getUserSubscriptions);
+  const payments = useQuery(api.authorizenet.getUserPayments);
+  const cancelSubscriptionAction = useAction(api.authorizenet.cancelSubscription);
   const reactivateSubscriptionAction = useAction(
-    api.stripe.reactivateSubscription,
+    api.authorizenet.reactivateSubscription,
   );
-  const getPortalUrl = useAction(api.stripe.getCustomerPortalUrl);
+  const getPaymentProfilePage = useAction(api.authorizenet.getPaymentProfilePage);
 
   const [cancelingId, setCancelingId] = useState<string | null>(null);
   const [reactivatingId, setReactivatingId] = useState<string | null>(null);
@@ -653,9 +657,9 @@ function ProfilePage({
   const handleManageBilling = async () => {
     setPortalLoading(true);
     try {
-      const result = await getPortalUrl({});
-      if (result?.url) {
-        window.location.href = result.url;
+      const result = await getPaymentProfilePage({});
+      if (result) {
+        submitHostedForm(result);
       } else {
         alert("No billing history found. Make a purchase first!");
       }
@@ -744,15 +748,15 @@ function ProfilePage({
           <div className="subscription-list">
             {subscriptions.map(
               (sub: {
-                stripeSubscriptionId: string;
-                stripeCustomerId: string;
+                subscriptionId: string;
+                customerProfileId: string;
                 status: string;
                 currentPeriodEnd: number;
                 cancelAtPeriodEnd: boolean;
                 quantity?: number;
               }) => (
                 <div
-                  key={sub.stripeSubscriptionId}
+                  key={sub.subscriptionId}
                   className="subscription-card"
                 >
                   <div className="subscription-header">
@@ -799,11 +803,11 @@ function ProfilePage({
                     <button
                       className="btn-cancel"
                       onClick={() =>
-                        handleCancelSubscription(sub.stripeSubscriptionId)
+                        handleCancelSubscription(sub.subscriptionId)
                       }
-                      disabled={cancelingId === sub.stripeSubscriptionId}
+                      disabled={cancelingId === sub.subscriptionId}
                     >
-                      {cancelingId === sub.stripeSubscriptionId
+                      {cancelingId === sub.subscriptionId
                         ? "Canceling..."
                         : "Cancel Subscription"}
                     </button>
@@ -815,11 +819,11 @@ function ProfilePage({
                       <button
                         className="btn-reactivate"
                         onClick={() =>
-                          handleReactivateSubscription(sub.stripeSubscriptionId)
+                          handleReactivateSubscription(sub.subscriptionId)
                         }
-                        disabled={reactivatingId === sub.stripeSubscriptionId}
+                        disabled={reactivatingId === sub.subscriptionId}
                       >
-                        {reactivatingId === sub.stripeSubscriptionId
+                        {reactivatingId === sub.subscriptionId
                           ? "Reactivating..."
                           : "Reactivate"}
                       </button>
@@ -864,7 +868,7 @@ function ProfilePage({
               <span>Status</span>
             </div>
             {payments.map((payment) => (
-              <div key={payment.stripePaymentIntentId} className="table-row">
+              <div key={payment.transId} className="table-row">
                 <span className="order-date">
                   {formatDate(payment.created)}
                 </span>
@@ -896,15 +900,15 @@ function TeamBillingPage() {
   const [orgId, setOrgId] = useState("demo-org-123");
 
   // Using the org-based queries
-  const orgSubscription = useQuery(api.stripe.getOrgSubscription, { orgId });
-  const orgInvoices = useQuery(api.stripe.getOrgInvoices, { orgId });
-  const updateSeatsAction = useAction(api.stripe.updateSeats);
+  const orgSubscription = useQuery(api.authorizenet.getOrgSubscription, { orgId });
+  const orgInvoices = useQuery(api.authorizenet.getOrgInvoices, { orgId });
+  const updateSeatsAction = useAction(api.authorizenet.updateSeats);
   const createTeamCheckout = useAction(
-    api.stripe.createTeamSubscriptionCheckout,
+    api.authorizenet.createTeamSubscriptionCheckout,
   );
-  const cancelSubscriptionAction = useAction(api.stripe.cancelSubscription);
+  const cancelSubscriptionAction = useAction(api.authorizenet.cancelSubscription);
   const reactivateSubscriptionAction = useAction(
-    api.stripe.reactivateSubscription,
+    api.authorizenet.reactivateSubscription,
   );
   const [updatingSeats, setUpdatingSeats] = useState(false);
   const [subscribing, setSubscribing] = useState(false);
@@ -936,7 +940,7 @@ function TeamBillingPage() {
     setUpdatingSeats(true);
     try {
       await updateSeatsAction({
-        subscriptionId: orgSubscription.stripeSubscriptionId,
+        subscriptionId: orgSubscription.subscriptionId,
         seatCount: newCount,
       });
     } catch (error) {
@@ -950,13 +954,14 @@ function TeamBillingPage() {
     setSubscribing(true);
     try {
       const result = await createTeamCheckout({
-        priceId: STRIPE_SUBSCRIPTION_PRICE_ID,
+        amount: PRODUCTS.monthlySubscription.amount,
+        planKey: PRODUCTS.monthlySubscription.planKey,
+        intervalLength: PRODUCTS.monthlySubscription.intervalLength,
+        intervalUnit: PRODUCTS.monthlySubscription.intervalUnit,
         orgId: orgId,
         quantity: teamSeats,
       });
-      if (result.url) {
-        window.location.href = result.url;
-      }
+      submitHostedForm(result);
     } catch (error) {
       console.error("Team checkout error:", error);
       alert("Failed to create checkout. Please try again.");
@@ -978,7 +983,7 @@ function TeamBillingPage() {
     setCanceling(true);
     try {
       await cancelSubscriptionAction({
-        subscriptionId: orgSubscription.stripeSubscriptionId,
+        subscriptionId: orgSubscription.subscriptionId,
       });
     } catch (error) {
       console.error("Cancel error:", error);
@@ -994,7 +999,7 @@ function TeamBillingPage() {
     setReactivating(true);
     try {
       await reactivateSubscriptionAction({
-        subscriptionId: orgSubscription.stripeSubscriptionId,
+        subscriptionId: orgSubscription.subscriptionId,
       });
     } catch (error) {
       console.error("Reactivate error:", error);
@@ -1231,7 +1236,7 @@ function TeamBillingPage() {
               <span>Status</span>
             </div>
             {orgInvoices.map((invoice) => (
-              <div key={invoice.stripeInvoiceId} className="table-row">
+              <div key={invoice.transId} className="table-row">
                 <span className="order-date">
                   {formatDate(invoice.created)}
                 </span>

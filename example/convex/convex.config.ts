@@ -1,7 +1,7 @@
 import { defineApp } from "convex/server";
-import stripe from "@convex-dev/stripe/convex.config.js";
+import authorizenet from "@convex-dev/authorizenet/convex.config.js";
 
 const app = defineApp();
-app.use(stripe);
+app.use(authorizenet);
 
 export default app;

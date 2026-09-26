@@ -19,7 +19,7 @@ export function initConvexTest<
 }
 
 export const components = componentsGeneric() as unknown as {
-  stripe: ComponentApi;
+  authorizenet: ComponentApi;
 };
 
 test("setup", () => {});
