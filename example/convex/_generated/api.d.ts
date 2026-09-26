@@ -49,5 +49,5 @@ export declare const internal: FilterApi<
 >;
 
 export declare const components: {
-  authorizenet: import("@convex-dev/authorizenet/_generated/component.js").ComponentApi<"authorizenet">;
+  authorizenet: import("convex-authorizenet/_generated/component.js").ComponentApi<"authorizenet">;
 };

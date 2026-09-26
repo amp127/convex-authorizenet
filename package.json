@@ -1,5 +1,5 @@
 {
-  "name": "@convex-dev/authorizenet",
+  "name": "convex-authorizenet",
   "description": "An Authorize.net component for Convex.",
   "repository": "github:amp127/convex-authorizenet",
   "homepage": "https://github.com/amp127/convex-authorizenet#readme",
@@ -7,6 +7,9 @@
     "url": "https://github.com/amp127/convex-authorizenet/issues"
   },
   "version": "0.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "license": "Apache-2.0",
   "keywords": [
     "convex",

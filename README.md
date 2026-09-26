@@ -1,4 +1,4 @@
-# @convex-dev/authorizenet
+# convex-authorizenet
 
 A Convex component for Authorize.net payments, customer profiles, and recurring billing.
 
@@ -32,14 +32,14 @@ Authorize.net does not provide Stripe-style Checkout sessions, Price IDs, invoic
 ### 1. Install the component
 
 ```bash
-npm install @convex-dev/authorizenet
+npm install convex-authorizenet
 ```
 
 ### 2. Add it to your Convex app
 
 ```typescript
 import { defineApp } from "convex/server";
-import authorizenet from "@convex-dev/authorizenet/convex.config.js";
+import authorizenet from "convex-authorizenet/convex.config.js";
 
 const app = defineApp();
 app.use(authorizenet);
@@ -98,7 +98,7 @@ Create a Signature Key under Account, then Settings, then Security Settings, the
 ```typescript
 import { httpRouter } from "convex/server";
 import { components } from "./_generated/api";
-import { registerRoutes } from "@convex-dev/authorizenet";
+import { registerRoutes } from "convex-authorizenet";
 
 const http = httpRouter();
 
@@ -114,7 +114,7 @@ export default http;
 ```typescript
 import { action } from "./_generated/server";
 import { components } from "./_generated/api";
-import { AuthorizeNet } from "@convex-dev/authorizenet";
+import { AuthorizeNet } from "convex-authorizenet";
 import { v } from "convex/values";
 
 const payments = new AuthorizeNet(components.authorizenet, {});
@@ -153,7 +153,7 @@ export const createSubscriptionCheckout = action({
 The browser posts the token. Do not navigate directly to `formUrl`.
 
 ```typescript
-import { submitHostedForm } from "@convex-dev/authorizenet/react";
+import { submitHostedForm } from "convex-authorizenet/react";
 
 submitHostedForm({ token: result.token, formUrl: result.formUrl });
 ```

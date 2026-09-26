@@ -1,6 +1,6 @@
 import "./App.css";
 import { SignInButton, SignOutButton, useUser } from "@clerk/clerk-react";
-import { submitHostedForm } from "@convex-dev/authorizenet/react";
+import { submitHostedForm } from "convex-authorizenet/react";
 import { useAction, useQuery } from "convex/react";
 import { api } from "../convex/_generated/api";
 import { useState } from "react";
@@ -170,7 +170,7 @@ function Hero({ setCurrentPage }: { setCurrentPage: (page: Page) => void }) {
             <em>delivered monthly</em>
           </h1>
           <p className="hero-subtitle">
-            The perfect example app for testing the @convex-dev/authorizenet
+            The perfect example app for testing the convex-authorizenet
             component. Buy a single hat or subscribe for monthly deliveries.
           </p>
           <div className="hero-buttons">
@@ -285,7 +285,7 @@ function Features() {
         <span className="section-badge">How It Works</span>
         <h2 className="section-title">Payments made simple</h2>
         <p className="section-subtitle">
-          Built with the @convex-dev/authorizenet component for Accept Hosted
+          Built with the convex-authorizenet component for Accept Hosted
           checkout and Automated Recurring Billing.
         </p>
       </div>

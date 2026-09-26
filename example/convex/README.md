@@ -1,6 +1,6 @@
 # Example Convex functions
 
-These functions show how an app uses `@convex-dev/authorizenet`.
+These functions show how an app uses `convex-authorizenet`.
 
 | File | Purpose |
 | --- | --- |
@@ -10,7 +10,7 @@ These functions show how an app uses `@convex-dev/authorizenet`.
 
 ```typescript
 import { defineApp } from "convex/server";
-import authorizenet from "@convex-dev/authorizenet/convex.config.js";
+import authorizenet from "convex-authorizenet/convex.config.js";
 
 const app = defineApp();
 app.use(authorizenet);
@@ -19,7 +19,7 @@ export default app;
 ```
 
 ```typescript
-import { AuthorizeNet } from "@convex-dev/authorizenet";
+import { AuthorizeNet } from "convex-authorizenet";
 import { components } from "./_generated/api";
 
 const payments = new AuthorizeNet(components.authorizenet, {});

@@ -1,6 +1,6 @@
 # Benji's Store
 
-Example app for `@convex-dev/authorizenet` with Clerk authentication.
+Example app for `convex-authorizenet` with Clerk authentication.
 
 ## What it shows
 

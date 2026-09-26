@@ -1,6 +1,6 @@
 import { httpRouter } from "convex/server";
 import { components } from "./_generated/api";
-import { registerRoutes } from "@convex-dev/authorizenet";
+import { registerRoutes } from "convex-authorizenet";
 
 const http = httpRouter();
 

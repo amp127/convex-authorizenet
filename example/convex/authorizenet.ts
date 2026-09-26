@@ -1,12 +1,12 @@
 /**
  * Benji's Store - Authorize.net integration
  *
- * Demonstrates the @convex-dev/authorizenet component with Clerk authentication.
+ * Demonstrates the convex-authorizenet component with Clerk authentication.
  */
 
 import { action, mutation, query } from "./_generated/server";
 import { components } from "./_generated/api";
-import { AuthorizeNet } from "@convex-dev/authorizenet";
+import { AuthorizeNet } from "convex-authorizenet";
 import { v } from "convex/values";
 
 const payments = new AuthorizeNet(components.authorizenet, {});
