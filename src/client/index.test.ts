@@ -93,8 +93,8 @@ describe("Authorize.net JSON client", () => {
       "49.00",
     );
     expect(
-      request.getHostedPaymentPageRequest.transactionRequest.profile.createProfile,
-    ).toBe(true);
+      request.getHostedPaymentPageRequest.transactionRequest.profile,
+    ).toBeUndefined();
     const options = JSON.parse(
       request.getHostedPaymentPageRequest.hostedPaymentSettings.setting.find(
         (setting: { settingName: string }) =>
@@ -136,6 +136,83 @@ describe("Authorize.net JSON client", () => {
       showCreditCard: true,
       showBankAccount: true,
     });
+  });
+
+  test("puts customerProfileId before order on Accept Hosted", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(ok({ token: "hosted-token" })));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new AuthorizeNetClient(
+      credentials.apiLoginId,
+      credentials.transactionKey,
+      "sandbox",
+    );
+    await client.getHostedPaymentPage({
+      amount: "10.00",
+      invoiceNumber: "c123",
+      customerProfileId: "123456",
+      successUrl: "https://example.com/success",
+      cancelUrl: "https://example.com/cancel",
+    });
+    const hostedCall = fetchMock.mock.calls[0] as unknown as
+      | [string, RequestInit]
+      | undefined;
+    const request = JSON.parse(String(hostedCall?.[1]?.body));
+    const transactionRequest =
+      request.getHostedPaymentPageRequest.transactionRequest as Record<
+        string,
+        unknown
+      >;
+    expect(transactionRequest.profile).toEqual({ customerProfileId: "123456" });
+    expect(Object.keys(transactionRequest)).toEqual([
+      "transactionType",
+      "amount",
+      "profile",
+      "order",
+    ]);
+  });
+
+  test("puts order before profile on ARB create", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(ok({ subscriptionId: "sub_1" })),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new AuthorizeNetClient(
+      credentials.apiLoginId,
+      credentials.transactionKey,
+      "sandbox",
+    );
+    await client.createSubscription({
+      name: "hat_monthly",
+      amount: "29.00",
+      intervalLength: 1,
+      intervalUnit: "months",
+      startDate: "2026-10-27",
+      customerProfileId: "123456",
+      customerPaymentProfileId: "789",
+      invoiceNumber: "ccheckout",
+      description: "hat_monthly",
+    });
+    const createCall = fetchMock.mock.calls[0] as unknown as
+      | [string, RequestInit]
+      | undefined;
+    const request = JSON.parse(String(createCall?.[1]?.body));
+    const subscription = request.ARBCreateSubscriptionRequest
+      .subscription as Record<string, unknown>;
+    expect(subscription.order).toEqual({
+      invoiceNumber: "ccheckout",
+      description: "hat_monthly",
+    });
+    expect(subscription.profile).toEqual({
+      customerProfileId: "123456",
+      customerPaymentProfileId: "789",
+    });
+    expect(Object.keys(subscription)).toEqual([
+      "name",
+      "paymentSchedule",
+      "amount",
+      "order",
+      "profile",
+    ]);
   });
 
   test("reads a bank account from a transaction", () => {

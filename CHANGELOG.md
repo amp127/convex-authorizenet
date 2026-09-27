@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Put `profile` before `order` on Accept Hosted requests. Authorize.net rejects `profile` after `order`. Guest checkout no longer sends `createProfile` on `transactionRequest`.
+- Put `order` before `profile` on ARB create requests. The subscription schema is the reverse of `transactionRequest`.
+
 ## 0.2.0
 
 - Accept Hosted checkout can show a bank account (eCheck) via `paymentMethods`.

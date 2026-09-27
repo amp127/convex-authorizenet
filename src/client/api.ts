@@ -364,16 +364,17 @@ export class AuthorizeNetClient {
     cancelUrl: string;
     paymentMethods?: HostedPaymentMethods;
   }): Promise<string> {
+    // transactionRequestType is an XSD sequence: profile must come before order.
     const transactionRequest: JsonObject = {
       transactionType: "authCaptureTransaction",
       amount: args.amount,
-      order: {
-        invoiceNumber: args.invoiceNumber,
-        description: (args.description ?? args.invoiceNumber).slice(0, 255),
-      },
-      profile: args.customerProfileId
-        ? { customerProfileId: args.customerProfileId }
-        : { createProfile: true },
+    };
+    if (args.customerProfileId) {
+      transactionRequest.profile = { customerProfileId: args.customerProfileId };
+    }
+    transactionRequest.order = {
+      invoiceNumber: args.invoiceNumber,
+      description: (args.description ?? args.invoiceNumber).slice(0, 255),
     };
     const body = await this.request("getHostedPaymentPageRequest", {
       transactionRequest,
@@ -456,27 +457,29 @@ export class AuthorizeNetClient {
     invoiceNumber?: string;
     description?: string;
   }): Promise<string> {
-    const body = await this.request("ARBCreateSubscriptionRequest", {
-      subscription: {
-        name: args.name.slice(0, 50),
-        paymentSchedule: {
-          interval: {
-            length: args.intervalLength,
-            unit: args.intervalUnit,
-          },
-          startDate: args.startDate,
-          totalOccurrences: 9999,
+    // ARBSubscriptionType is an XSD sequence: order must come before profile.
+    const subscription: JsonObject = {
+      name: args.name.slice(0, 50),
+      paymentSchedule: {
+        interval: {
+          length: args.intervalLength,
+          unit: args.intervalUnit,
         },
-        amount: args.amount,
-        profile: {
-          customerProfileId: args.customerProfileId,
-          customerPaymentProfileId: args.customerPaymentProfileId,
-        },
-        order: {
-          invoiceNumber: args.invoiceNumber,
-          description: args.description?.slice(0, 255),
-        },
+        startDate: args.startDate,
+        totalOccurrences: 9999,
       },
+      amount: args.amount,
+    };
+    subscription.order = {
+      invoiceNumber: args.invoiceNumber,
+      description: args.description?.slice(0, 255),
+    };
+    subscription.profile = {
+      customerProfileId: args.customerProfileId,
+      customerPaymentProfileId: args.customerPaymentProfileId,
+    };
+    const body = await this.request("ARBCreateSubscriptionRequest", {
+      subscription,
     });
     const subscriptionId = asString(body.subscriptionId);
     if (!subscriptionId) {
