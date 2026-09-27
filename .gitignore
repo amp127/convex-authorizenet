@@ -1,3 +1,5 @@
+.specstory/
+
 .DS_Store
 .idea
 .env

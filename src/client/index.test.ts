@@ -1,6 +1,6 @@
 import { describe, expect, test, vi, afterEach } from "vitest";
-import { AuthorizeNetClient } from "./api.js";
-import { mapSubscriptionStatus } from "./billing.js";
+import { AuthorizeNetClient, parseTransaction } from "./api.js";
+import { mapSubscriptionStatus, resolvePaymentStatus } from "./billing.js";
 import {
   AuthorizeNet,
   handleWebhookRequest,
@@ -95,6 +95,100 @@ describe("Authorize.net JSON client", () => {
     expect(
       request.getHostedPaymentPageRequest.transactionRequest.profile.createProfile,
     ).toBe(true);
+    const options = JSON.parse(
+      request.getHostedPaymentPageRequest.hostedPaymentSettings.setting.find(
+        (setting: { settingName: string }) =>
+          setting.settingName === "hostedPaymentPaymentOptions",
+      ).settingValue,
+    );
+    expect(options).toMatchObject({
+      showCreditCard: true,
+      showBankAccount: false,
+    });
+  });
+
+  test("can show a bank account on Accept Hosted", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(ok({ token: "hosted-token" })));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new AuthorizeNetClient(
+      credentials.apiLoginId,
+      credentials.transactionKey,
+      "sandbox",
+    );
+    await client.getHostedPaymentPage({
+      amount: "10.00",
+      invoiceNumber: "c123",
+      successUrl: "https://example.com/success",
+      cancelUrl: "https://example.com/cancel",
+      paymentMethods: { card: true, bankAccount: true },
+    });
+    const hostedCall = fetchMock.mock.calls[0] as unknown as
+      | [string, RequestInit]
+      | undefined;
+    const request = JSON.parse(String(hostedCall?.[1]?.body));
+    const options = JSON.parse(
+      request.getHostedPaymentPageRequest.hostedPaymentSettings.setting.find(
+        (setting: { settingName: string }) =>
+          setting.settingName === "hostedPaymentPaymentOptions",
+      ).settingValue,
+    );
+    expect(options).toMatchObject({
+      showCreditCard: true,
+      showBankAccount: true,
+    });
+  });
+
+  test("reads a bank account from a transaction", () => {
+    const transaction = parseTransaction({
+      transaction: {
+        transId: "txn_bank",
+        responseCode: 1,
+        authAmount: 12.5,
+        transactionStatus: "capturedPendingSettlement",
+        payment: {
+          bankAccount: {
+            accountType: "checking",
+            accountNumber: "XXXX6789",
+          },
+        },
+      },
+    });
+    expect(transaction.accountType).toBe("bank");
+    expect(transaction.cardType).toBe("checking");
+    expect(transaction.last4).toBe("6789");
+    expect(transaction.transactionStatus).toBe("capturedPendingSettlement");
+    expect(
+      resolvePaymentStatus({
+        eventType: "net.authorize.payment.authcapture.created",
+        responseCode: 1,
+        accountType: transaction.accountType,
+        transactionStatus: transaction.transactionStatus,
+      }),
+    ).toBe("pending");
+    expect(
+      resolvePaymentStatus({
+        eventType: "net.authorize.payment.authcapture.created",
+        responseCode: 1,
+        accountType: "bank",
+        transactionStatus: "settledSuccessfully",
+      }),
+    ).toBe("succeeded");
+    expect(
+      resolvePaymentStatus({
+        eventType: "net.authorize.payment.void.created",
+        responseCode: 1,
+        accountType: "bank",
+        transactionStatus: "voided",
+      }),
+    ).toBe("voided");
+    expect(
+      resolvePaymentStatus({
+        eventType: "net.authorize.payment.authcapture.created",
+        responseCode: 1,
+        accountType: "card",
+        transactionStatus: "capturedPendingSettlement",
+      }),
+    ).toBe("succeeded");
   });
 
   test("updates and deletes customer profiles", async () => {

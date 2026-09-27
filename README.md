@@ -6,7 +6,7 @@ Requires Node.js 18 or later.
 
 ## Features
 
-- Accept Hosted checkout for one-time payments and subscription signup
+- Accept Hosted checkout for one-time card and eCheck (bank account) payments, and subscription signup
 - Customer Information Manager (CIM) profiles linked to your users
 - Automated Recurring Billing (ARB) subscriptions
 - Seat quantity, stored as unit amount times quantity
@@ -20,6 +20,7 @@ Requires Node.js 18 or later.
 Authorize.net does not provide Stripe-style Checkout sessions, Price IDs, invoices, or a billing portal.
 
 - Checkout returns a form token. The browser must POST that token to Accept Hosted. It cannot redirect to a URL.
+- Bank account fields require eCheck.Net on the merchant account. Pass `paymentMethods: { card: true, bankAccount: true }` to `createHostedCheckout`. The default is card only. An unsettled eCheck is stored as `pending` until Authorize.net reports `settledSuccessfully`.
 - There is no price catalog. Pass an amount in cents and, for subscriptions, a billing interval.
 - The hosted profile page manages payment methods only. Cancel, reactivate, and seat changes use the API.
 - Cancel-at-period-end is emulated. ARB is updated so `totalOccurrences` equals the number of payments already collected, and the local row keeps `cancelAtPeriodEnd`.
@@ -174,7 +175,7 @@ const payments = new AuthorizeNet(components.authorizenet, {
 | --- | --- |
 | `getOrCreateCustomer()` | Find a local customer or create a CIM profile |
 | `createCustomer()` | Create a CIM customer profile |
-| `createHostedCheckout()` | Accept Hosted payment, or a hosted profile page when `mode` is `setup` |
+| `createHostedCheckout()` | Accept Hosted payment, or a hosted profile page when `mode` is `setup`. `paymentMethods.bankAccount` shows eCheck when the merchant has eCheck.Net |
 | `createHostedProfilePage()` | Hosted page for managing saved payment methods |
 | `cancelSubscription()` | Cancel now, or stop future billings after the current cycle |
 | `reactivateSubscription()` | Restore an open-ended ARB occurrence count |

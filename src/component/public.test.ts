@@ -206,6 +206,34 @@ test("refund updates the original payment", async () => {
   expect(original?.status).toBe("refunded");
 });
 
+test("bank payment stays pending until it settles", async () => {
+  const t = convexTest(schema, modules);
+
+  await t.mutation(api.private.handlePaymentUpsert, {
+    transId: "txn_bank",
+    amount: 2500,
+    currency: "usd",
+    status: "pending",
+    accountType: "bank",
+    transactionStatus: "capturedPendingSettlement",
+    created: 1_700_000_000,
+  });
+  await t.mutation(api.private.handlePaymentUpsert, {
+    transId: "txn_bank",
+    amount: 2500,
+    currency: "usd",
+    status: "succeeded",
+    accountType: "bank",
+    transactionStatus: "settledSuccessfully",
+    created: 1_700_000_000,
+  });
+
+  const payment = await t.query(api.public.getPayment, { transId: "txn_bank" });
+  expect(payment?.status).toBe("succeeded");
+  expect(payment?.accountType).toBe("bank");
+  expect(payment?.transactionStatus).toBe("settledSuccessfully");
+});
+
 test("invoice status does not move backwards from paid", async () => {
   const t = convexTest(schema, modules);
 

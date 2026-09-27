@@ -100,6 +100,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "mutation",
         "internal",
         {
+          accountType?: "card" | "bank";
           amount: number;
           created: number;
           currency: string;
@@ -108,6 +109,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           refTransId?: string;
           status: string;
           subscriptionId?: string;
+          transactionStatus?: string;
           transId: string;
         },
         null,
@@ -256,6 +258,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { transId: string },
         {
+          accountType?: "card" | "bank";
           amount: number;
           created: number;
           currency: string;
@@ -264,6 +267,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           orgId?: string;
           status: string;
           subscriptionId?: string;
+          transactionStatus?: string;
           transId: string;
           userId?: string;
         } | null,
@@ -408,6 +412,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { customerProfileId: string },
         Array<{
+          accountType?: "card" | "bank";
           amount: number;
           created: number;
           currency: string;
@@ -416,6 +421,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           orgId?: string;
           status: string;
           subscriptionId?: string;
+          transactionStatus?: string;
           transId: string;
           userId?: string;
         }>,
@@ -426,6 +432,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { orgId: string },
         Array<{
+          accountType?: "card" | "bank";
           amount: number;
           created: number;
           currency: string;
@@ -434,6 +441,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           orgId?: string;
           status: string;
           subscriptionId?: string;
+          transactionStatus?: string;
           transId: string;
           userId?: string;
         }>,
@@ -444,6 +452,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         "internal",
         { userId: string },
         Array<{
+          accountType?: "card" | "bank";
           amount: number;
           created: number;
           currency: string;
@@ -452,6 +461,7 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
           orgId?: string;
           status: string;
           subscriptionId?: string;
+          transactionStatus?: string;
           transId: string;
           userId?: string;
         }>,

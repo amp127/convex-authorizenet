@@ -10,7 +10,7 @@ import {
   createCheckoutId,
   currentPeriodEndUnix,
   mapSubscriptionStatus,
-  paymentStatusFromEvent,
+  resolvePaymentStatus,
   type BillingInterval,
   type IntervalUnit,
 } from "./billing.js";
@@ -261,6 +261,11 @@ export class AuthorizeNet {
       interval?: BillingInterval;
       metadata?: Record<string, string>;
       subscriptionMetadata?: Record<string, string>;
+      /**
+       * Accept Hosted payment options. Card is on and bank account is off
+       * unless the caller sets them. Bank account requires eCheck.Net.
+       */
+      paymentMethods?: { card?: boolean; bankAccount?: boolean };
     },
   ) {
     const quantity = args.quantity ?? 1;
@@ -325,6 +330,7 @@ export class AuthorizeNet {
       customerProfileId: args.customerId,
       successUrl: args.successUrl,
       cancelUrl: args.cancelUrl,
+      paymentMethods: args.paymentMethods,
     });
 
     return {
@@ -619,10 +625,12 @@ async function handlePaymentEvent(
   currency: string,
 ) {
   const transaction = await gateway.getTransactionDetails(String(event.payload.id));
-  const status = paymentStatusFromEvent(
-    event.eventType,
-    transaction.responseCode ?? event.payload.responseCode,
-  );
+  const status = resolvePaymentStatus({
+    eventType: event.eventType,
+    responseCode: transaction.responseCode ?? event.payload.responseCode,
+    accountType: transaction.accountType,
+    transactionStatus: transaction.transactionStatus,
+  });
   const checkout = transaction.invoiceNumber
     ? ((await ctx.runQuery(component.public.getCheckoutSession, {
         checkoutId: transaction.invoiceNumber,
@@ -646,6 +654,8 @@ async function handlePaymentEvent(
     amount: transaction.amountCents,
     currency,
     status,
+    accountType: transaction.accountType,
+    transactionStatus: transaction.transactionStatus,
     created,
     metadata,
   });
@@ -709,7 +719,7 @@ async function handlePaymentEvent(
     });
   }
 
-  if (checkout && checkout.status === "open" && status === "succeeded") {
+  if (checkout && checkout.status === "open" && (status === "succeeded" || status === "pending")) {
     await ctx.runMutation(component.private.handleCheckoutCompleted, {
       checkoutId: checkout.checkoutId,
       customerProfileId: transaction.customerProfileId ?? checkout.customerProfileId,

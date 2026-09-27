@@ -75,6 +75,10 @@ export default defineSchema({
     amount: v.number(),
     currency: v.string(),
     status: v.string(),
+    /** `card` or `bank` (eCheck). Absent on rows written before this field existed. */
+    accountType: v.optional(v.union(v.literal("card"), v.literal("bank"))),
+    /** Authorize.net transactionStatus, such as settledSuccessfully. */
+    transactionStatus: v.optional(v.string()),
     created: v.number(),
     metadata: v.optional(v.any()),
     orgId: v.optional(v.string()),

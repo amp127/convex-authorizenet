@@ -46,7 +46,8 @@ function shouldApplyInvoiceLifecycleFields(
 }
 
 const PAYMENT_STATUS_RANK: Record<string, number> = {
-  failed: 0,
+  pending: 0,
+  failed: 1,
   held: 1,
   succeeded: 2,
   refunded: 3,
@@ -447,6 +448,8 @@ export const handlePaymentUpsert = mutation({
     amount: v.number(),
     currency: v.string(),
     status: v.string(),
+    accountType: v.optional(v.union(v.literal("card"), v.literal("bank"))),
+    transactionStatus: v.optional(v.string()),
     created: v.number(),
     metadata: v.optional(v.any()),
   },
@@ -484,6 +487,8 @@ export const handlePaymentUpsert = mutation({
         amount: args.amount,
         currency: args.currency,
         status: args.status,
+        accountType: args.accountType,
+        transactionStatus: args.transactionStatus,
         created: args.created,
         metadata: args.metadata === undefined ? undefined : linked.metadata,
         orgId: linked.orgId,
@@ -501,6 +506,10 @@ export const handlePaymentUpsert = mutation({
         !existing.subscriptionId && { subscriptionId: args.subscriptionId }),
       ...(shouldApplyPaymentStatus(existing.status, args.status) && {
         status: args.status,
+      }),
+      ...(args.accountType && { accountType: args.accountType }),
+      ...(args.transactionStatus && {
+        transactionStatus: args.transactionStatus,
       }),
       ...(linked.orgId && !existing.orgId && { orgId: linked.orgId }),
       ...(linked.userId && !existing.userId && { userId: linked.userId }),

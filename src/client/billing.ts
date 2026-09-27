@@ -74,10 +74,18 @@ export function currentPeriodEndUnix(
   return Math.floor(cursor.getTime() / 1000);
 }
 
+export type StoredPaymentStatus =
+  | "succeeded"
+  | "pending"
+  | "failed"
+  | "held"
+  | "refunded"
+  | "voided";
+
 export function paymentStatusFromEvent(
   eventType: string,
   responseCode: number | undefined,
-): "succeeded" | "failed" | "held" | "refunded" | "voided" {
+): Exclude<StoredPaymentStatus, "pending"> {
   if (eventType.endsWith(".refund.created")) return "refunded";
   if (eventType.endsWith(".void.created")) return "voided";
   if (eventType.endsWith(".fraud.held")) return "held";
@@ -86,4 +94,25 @@ export function paymentStatusFromEvent(
   if (responseCode === 1) return "succeeded";
   if (responseCode === 4) return "held";
   return "failed";
+}
+
+/**
+ * eCheck is accepted before the bank settles it. A bank payment stays pending
+ * until Authorize.net reports settledSuccessfully. Voids and refunds are unchanged.
+ */
+export function resolvePaymentStatus(args: {
+  eventType: string;
+  responseCode: number | undefined;
+  accountType?: "card" | "bank";
+  transactionStatus?: string;
+}): StoredPaymentStatus {
+  const status = paymentStatusFromEvent(args.eventType, args.responseCode);
+  if (
+    status === "succeeded" &&
+    args.accountType === "bank" &&
+    args.transactionStatus !== "settledSuccessfully"
+  ) {
+    return "pending";
+  }
+  return status;
 }

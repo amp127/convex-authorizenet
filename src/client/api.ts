@@ -61,6 +61,13 @@ export type GatewaySubscription = {
   latestTransId?: string;
 };
 
+export type PaymentAccountType = "card" | "bank";
+
+export type HostedPaymentMethods = {
+  card?: boolean;
+  bankAccount?: boolean;
+};
+
 export type GatewayTransaction = {
   transId: string;
   refTransId?: string;
@@ -71,8 +78,11 @@ export type GatewayTransaction = {
   subscriptionId?: string;
   invoiceNumber?: string;
   submitTimeUTC?: string;
+  /** Card brand, or bank account type such as checking. */
   cardType?: string;
   last4?: string;
+  accountType?: PaymentAccountType;
+  transactionStatus?: string;
 };
 
 type JsonObject = Record<string, unknown>;
@@ -137,16 +147,50 @@ export function cardLast4(cardNumber: string | undefined): string | undefined {
   return digits.slice(-4);
 }
 
+function parsePaymentInstrument(payment: JsonObject | undefined): {
+  accountType?: PaymentAccountType;
+  brand?: string;
+  last4?: string;
+} {
+  const card = asObject(payment?.creditCard);
+  if (card) {
+    return {
+      accountType: "card",
+      brand: asString(card.cardType),
+      last4: cardLast4(asString(card.cardNumber)),
+    };
+  }
+  const bank = asObject(payment?.bankAccount);
+  if (bank) {
+    return {
+      accountType: "bank",
+      brand: asString(bank.accountType),
+      last4: cardLast4(asString(bank.accountNumber)),
+    };
+  }
+  return {};
+}
+
+export function hostedPaymentMethodFlags(
+  methods?: HostedPaymentMethods,
+): { showCreditCard: boolean; showBankAccount: boolean } {
+  const showCreditCard = methods?.card ?? true;
+  const showBankAccount = methods?.bankAccount ?? false;
+  if (!showCreditCard && !showBankAccount) {
+    throw new Error("At least one hosted payment method must be enabled");
+  }
+  return { showCreditCard, showBankAccount };
+}
+
 function parsePaymentProfile(value: unknown): GatewayPaymentProfile | undefined {
   const profile = asObject(value);
   const customerPaymentProfileId = asString(profile?.customerPaymentProfileId);
   if (!profile || !customerPaymentProfileId) return undefined;
-  const payment = asObject(profile.payment);
-  const card = asObject(payment?.creditCard);
+  const instrument = parsePaymentInstrument(asObject(profile.payment));
   return {
     customerPaymentProfileId,
-    brand: asString(card?.cardType),
-    last4: cardLast4(asString(card?.cardNumber)),
+    brand: instrument.brand,
+    last4: instrument.last4,
   };
 }
 
@@ -219,7 +263,7 @@ export function parseTransaction(body: JsonObject): GatewayTransaction {
   const order = asObject(transaction.order);
   const subscription = asObject(transaction.subscription);
   const payment = asObject(transaction.payment);
-  const card = asObject(payment?.creditCard);
+  const instrument = parsePaymentInstrument(payment);
   const amount = asNumber(transaction.settleAmount) ?? asNumber(transaction.authAmount) ?? 0;
   return {
     transId,
@@ -231,8 +275,10 @@ export function parseTransaction(body: JsonObject): GatewayTransaction {
     subscriptionId: asString(subscription?.id),
     invoiceNumber: asString(order?.invoiceNumber),
     submitTimeUTC: asString(transaction.submitTimeUTC),
-    cardType: asString(card?.cardType),
-    last4: cardLast4(asString(card?.cardNumber)),
+    cardType: instrument.brand,
+    last4: instrument.last4,
+    accountType: instrument.accountType,
+    transactionStatus: asString(transaction.transactionStatus),
   };
 }
 
@@ -316,6 +362,7 @@ export class AuthorizeNetClient {
     customerProfileId?: string;
     successUrl: string;
     cancelUrl: string;
+    paymentMethods?: HostedPaymentMethods;
   }): Promise<string> {
     const transactionRequest: JsonObject = {
       transactionType: "authCaptureTransaction",
@@ -350,8 +397,7 @@ export class AuthorizeNetClient {
             settingName: "hostedPaymentPaymentOptions",
             settingValue: JSON.stringify({
               cardCodeRequired: true,
-              showCreditCard: true,
-              showBankAccount: false,
+              ...hostedPaymentMethodFlags(args.paymentMethods),
             }),
           },
           {
