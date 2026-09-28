@@ -34,6 +34,25 @@ export class AuthorizeNetError extends Error {
   }
 }
 
+const HOSTED_RETURN_URL_MESSAGE =
+  "Accept Hosted return URLs must be http:// or https:// with no query string or hash. Authorize.net rejects ? and # with 'url must begin with http:// or https://'.";
+
+/** Authorize.net hostedPaymentReturnOptions.url cannot contain ? or #. */
+export function assertHostedReturnUrl(url: string, field = "url"): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`${field}: ${HOSTED_RETURN_URL_MESSAGE}`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`${field}: ${HOSTED_RETURN_URL_MESSAGE}`);
+  }
+  if (parsed.search !== "" || parsed.hash !== "" || url.includes("?") || url.includes("#")) {
+    throw new Error(`${field}: ${HOSTED_RETURN_URL_MESSAGE}`);
+  }
+}
+
 export type GatewayPaymentProfile = {
   customerPaymentProfileId: string;
   brand?: string;
@@ -138,6 +157,57 @@ function assertOk(body: JsonObject): void {
     const code = asString(asObject(list[0])?.code);
     throw new AuthorizeNetError(text || "Authorize.net request failed", code);
   }
+}
+
+function messageList(value: unknown): JsonObject[] {
+  if (Array.isArray(value)) {
+    return value.map(asObject).filter((item): item is JsonObject => Boolean(item));
+  }
+  const single = asObject(value);
+  return single ? [single] : [];
+}
+
+/**
+ * createTransactionRequest can return resultCode Error with a decline, or
+ * resultCode Ok with responseCode 2. Read transactionResponse either way.
+ */
+export function parseCreateTransaction(body: JsonObject): {
+  transId: string;
+  responseCode?: number;
+} {
+  const transaction = asObject(body.transactionResponse);
+  const responseCode = asNumber(transaction?.responseCode);
+  const errors = messageList(transaction?.errors);
+  const messages = messageList(transaction?.messages);
+  const errorText =
+    errors
+      .map((error) => asString(error.errorText) ?? asString(error.text))
+      .filter((value): value is string => Boolean(value))
+      .join("; ") ||
+    messages
+      .map((message) => asString(message.description) ?? asString(message.text))
+      .filter((value): value is string => Boolean(value))
+      .join("; ");
+  const errorCode =
+    asString(errors[0]?.errorCode) ?? asString(messages[0]?.code);
+  if (responseCode !== 1 && responseCode !== 4) {
+    if (!transaction) {
+      assertOk(body);
+      throw new AuthorizeNetError("Authorize.net did not return a transaction");
+    }
+    throw new AuthorizeNetError(
+      errorText || "Authorize.net declined the charge",
+      errorCode,
+    );
+  }
+  const transId = asString(transaction?.transId);
+  if (!transId || transId === "0") {
+    throw new AuthorizeNetError(
+      errorText || "Authorize.net did not return a transaction id",
+      errorCode,
+    );
+  }
+  return { transId, responseCode };
 }
 
 export function cardLast4(cardNumber: string | undefined): string | undefined {
@@ -293,7 +363,7 @@ export class AuthorizeNetClient {
     this.endpoints = endpointsFor(environment);
   }
 
-  private async request(requestKey: string, request: JsonObject): Promise<JsonObject> {
+  private async post(requestKey: string, request: JsonObject): Promise<JsonObject> {
     const response = await fetch(this.endpoints.api, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -308,10 +378,15 @@ export class AuthorizeNetClient {
       }),
     });
     const body = parseAuthorizeNetJson(await response.text());
-    assertOk(body);
     if (!response.ok) {
       throw new AuthorizeNetError(`Authorize.net request failed (${response.status})`);
     }
+    return body;
+  }
+
+  private async request(requestKey: string, request: JsonObject): Promise<JsonObject> {
+    const body = await this.post(requestKey, request);
+    assertOk(body);
     return body;
   }
 
@@ -364,6 +439,8 @@ export class AuthorizeNetClient {
     cancelUrl: string;
     paymentMethods?: HostedPaymentMethods;
   }): Promise<string> {
+    assertHostedReturnUrl(args.successUrl, "successUrl");
+    assertHostedReturnUrl(args.cancelUrl, "cancelUrl");
     // transactionRequestType is an XSD sequence: profile must come before order.
     const transactionRequest: JsonObject = {
       transactionType: "authCaptureTransaction",
@@ -419,6 +496,7 @@ export class AuthorizeNetClient {
     customerProfileId: string;
     returnUrl: string;
   }): Promise<string> {
+    assertHostedReturnUrl(args.returnUrl, "returnUrl");
     const body = await this.request("getHostedProfilePageRequest", {
       customerProfileId: args.customerProfileId,
       hostedProfileSettings: {
@@ -444,6 +522,39 @@ export class AuthorizeNetClient {
   async getTransactionDetails(transId: string): Promise<GatewayTransaction> {
     const body = await this.request("getTransactionDetailsRequest", { transId });
     return parseTransaction(body);
+  }
+
+  /**
+   * Charge a saved CIM payment profile. Merchant-initiated stored-credential
+   * flags keep Visa/MC card-on-file transactions in the unscheduled MIT path.
+   */
+  async createProfileTransaction(args: {
+    amount: string;
+    customerProfileId: string;
+    customerPaymentProfileId: string;
+    invoiceNumber?: string;
+    description?: string;
+  }): Promise<{ transId: string; responseCode?: number }> {
+    // transactionRequestType is an XSD sequence: profile, then order, then processingOptions.
+    const transactionRequest: JsonObject = {
+      transactionType: "authCaptureTransaction",
+      amount: args.amount,
+      profile: {
+        customerProfileId: args.customerProfileId,
+        paymentProfile: { paymentProfileId: args.customerPaymentProfileId },
+      },
+    };
+    if (args.invoiceNumber || args.description) {
+      transactionRequest.order = {
+        ...(args.invoiceNumber ? { invoiceNumber: args.invoiceNumber } : {}),
+        ...(args.description
+          ? { description: args.description.slice(0, 255) }
+          : {}),
+      };
+    }
+    transactionRequest.processingOptions = { isSubsequentAuth: "true" };
+    const body = await this.post("createTransactionRequest", { transactionRequest });
+    return parseCreateTransaction(body);
   }
 
   async createSubscription(args: {

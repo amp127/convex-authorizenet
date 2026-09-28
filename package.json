@@ -9,7 +9,7 @@
   "bugs": {
     "url": "https://github.com/amp127/convex-authorizenet/issues"
   },
-  "version": "0.2.1",
+  "version": "0.2.3",
   "publishConfig": {
     "access": "public"
   },

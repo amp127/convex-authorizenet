@@ -1,5 +1,5 @@
 import { describe, expect, test, vi, afterEach } from "vitest";
-import { AuthorizeNetClient, parseTransaction } from "./api.js";
+import { AuthorizeNetClient, parseTransaction, assertHostedReturnUrl } from "./api.js";
 import { mapSubscriptionStatus, resolvePaymentStatus } from "./billing.js";
 import {
   AuthorizeNet,
@@ -171,6 +171,37 @@ describe("Authorize.net JSON client", () => {
     ]);
   });
 
+  test("rejects Accept Hosted return URLs with a query string or hash", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(ok({ token: "hosted-token" })));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new AuthorizeNetClient(
+      credentials.apiLoginId,
+      credentials.transactionKey,
+      "sandbox",
+    );
+    const page = {
+      amount: "10.00",
+      invoiceNumber: "c123",
+      cancelUrl: "https://example.com/cancel",
+    };
+    await expect(
+      client.getHostedPaymentPage({
+        ...page,
+        successUrl: "https://example.com/?payment=sandbox",
+      }),
+    ).rejects.toThrow(/no query string or hash/);
+    await expect(
+      client.getHostedPaymentPage({
+        ...page,
+        successUrl: "https://example.com/#payment=sandbox",
+      }),
+    ).rejects.toThrow(/no query string or hash/);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(() =>
+      assertHostedReturnUrl("https://example.com/return", "successUrl"),
+    ).not.toThrow();
+  });
+
   test("puts order before profile on ARB create", async () => {
     const fetchMock = vi.fn(async () =>
       jsonResponse(ok({ subscriptionId: "sub_1" })),
@@ -266,6 +297,84 @@ describe("Authorize.net JSON client", () => {
         transactionStatus: "capturedPendingSettlement",
       }),
     ).toBe("succeeded");
+  });
+
+  test("charges a saved CIM payment profile as a subsequent auth", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(
+        ok({
+          transactionResponse: {
+            transId: "txn_profile",
+            responseCode: "1",
+          },
+        }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new AuthorizeNetClient(
+      credentials.apiLoginId,
+      credentials.transactionKey,
+      "sandbox",
+    );
+    const created = await client.createProfileTransaction({
+      amount: "12.34",
+      customerProfileId: "123456",
+      customerPaymentProfileId: "789",
+      invoiceNumber: "ccharge",
+      description: "Account balance",
+    });
+    expect(created).toEqual({ transId: "txn_profile", responseCode: 1 });
+    const createCall = fetchMock.mock.calls[0] as unknown as
+      | [string, RequestInit]
+      | undefined;
+    const request = JSON.parse(String(createCall?.[1]?.body));
+    const transactionRequest = request.createTransactionRequest
+      .transactionRequest as Record<string, unknown>;
+    expect(transactionRequest.profile).toEqual({
+      customerProfileId: "123456",
+      paymentProfile: { paymentProfileId: "789" },
+    });
+    expect(transactionRequest.processingOptions).toEqual({
+      isSubsequentAuth: "true",
+    });
+    expect(Object.keys(transactionRequest)).toEqual([
+      "transactionType",
+      "amount",
+      "profile",
+      "order",
+      "processingOptions",
+    ]);
+  });
+
+  test("surfaces a declined CIM charge", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse({
+          messages: {
+            resultCode: "Error",
+            message: [{ code: "E00027", text: "The transaction was unsuccessful." }],
+          },
+          transactionResponse: {
+            responseCode: "2",
+            transId: "0",
+            errors: [{ errorCode: "2", errorText: "This transaction has been declined." }],
+          },
+        }),
+      ),
+    );
+    const client = new AuthorizeNetClient(
+      credentials.apiLoginId,
+      credentials.transactionKey,
+      "sandbox",
+    );
+    await expect(
+      client.createProfileTransaction({
+        amount: "10.00",
+        customerProfileId: "123456",
+        customerPaymentProfileId: "789",
+      }),
+    ).rejects.toThrow(/declined/);
   });
 
   test("updates and deletes customer profiles", async () => {
@@ -393,6 +502,225 @@ describe("AuthorizeNet client", () => {
     const request = JSON.parse(String(checkoutCall?.[1]?.body));
     expect(request.getHostedPaymentPageRequest.transactionRequest.amount).toBe(
       "49.00",
+    );
+  });
+
+  test("createProfileCharge stores the payment and profile", async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.createTransactionRequest) {
+        return jsonResponse(
+          ok({
+            transactionResponse: { transId: "txn_saved", responseCode: "1" },
+          }),
+        );
+      }
+      return jsonResponse(
+        ok({
+          transaction: {
+            transId: "txn_saved",
+            responseCode: 1,
+            settleAmount: 40,
+            submitTimeUTC: "2026-09-28T18:00:00Z",
+            profile: {
+              customerProfileId: "profile_1",
+              customerPaymentProfileId: "pay_1",
+            },
+            payment: {
+              creditCard: { cardNumber: "XXXX4242", cardType: "Visa" },
+            },
+            transactionStatus: "capturedPendingSettlement",
+          },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const runMutation = vi.fn().mockResolvedValue(null);
+    const client = new AuthorizeNet(components.authorizenet, credentials);
+    const result = await client.createProfileCharge(
+      { runQuery: vi.fn(), runMutation, runAction: vi.fn() },
+      {
+        customerProfileId: "profile_1",
+        customerPaymentProfileId: "pay_1",
+        amount: 4000,
+        metadata: { userId: "revio:42", revioCustomerId: "42" },
+        description: "Account balance",
+      },
+    );
+    expect(result).toMatchObject({
+      transId: "txn_saved",
+      amountCents: 4000,
+      status: "succeeded",
+      accountType: "card",
+    });
+    expect(runMutation).toHaveBeenCalledWith(
+      components.authorizenet.private.handlePaymentUpsert,
+      expect.objectContaining({
+        transId: "txn_saved",
+        customerProfileId: "profile_1",
+        amount: 4000,
+        status: "succeeded",
+        metadata: { userId: "revio:42", revioCustomerId: "42" },
+      }),
+    );
+    expect(runMutation).toHaveBeenCalledWith(
+      components.authorizenet.private.upsertPaymentProfile,
+      expect.objectContaining({
+        customerProfileId: "profile_1",
+        customerPaymentProfileId: "pay_1",
+        last4: "4242",
+        brand: "Visa",
+      }),
+    );
+  });
+
+  test("refreshCustomerProfiles upserts payment methods", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(
+          ok({
+            profile: {
+              customerProfileId: "profile_1",
+              email: "ada@example.com",
+              paymentProfiles: {
+                customerPaymentProfileId: "pay_9",
+                payment: {
+                  creditCard: { cardNumber: "XXXX1111", cardType: "Visa" },
+                },
+              },
+            },
+          }),
+        ),
+      ),
+    );
+    const runMutation = vi.fn().mockResolvedValue(null);
+    const client = new AuthorizeNet(components.authorizenet, credentials);
+    const result = await client.refreshCustomerProfiles(
+      { runQuery: vi.fn(), runMutation, runAction: vi.fn() },
+      { customerProfileId: "profile_1" },
+    );
+    expect(result.paymentProfiles).toEqual([
+      { customerPaymentProfileId: "pay_9", brand: "Visa", last4: "1111" },
+    ]);
+    expect(runMutation).toHaveBeenCalledWith(
+      components.authorizenet.public.createOrUpdateCustomer,
+      expect.objectContaining({ customerProfileId: "profile_1" }),
+    );
+    expect(runMutation).toHaveBeenCalledWith(
+      components.authorizenet.private.upsertPaymentProfile,
+      expect.objectContaining({
+        customerPaymentProfileId: "pay_9",
+        last4: "1111",
+      }),
+    );
+  });
+
+  test("createSubscription starts ARB on a saved payment profile", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(ok({ subscriptionId: "sub_api" })));
+    vi.stubGlobal("fetch", fetchMock);
+    const runMutation = vi.fn().mockResolvedValue(null);
+    const client = new AuthorizeNet(components.authorizenet, credentials);
+    const result = await client.createSubscription(
+      { runQuery: vi.fn(), runMutation, runAction: vi.fn() },
+      {
+        customerProfileId: "profile_1",
+        customerPaymentProfileId: "pay_1",
+        amount: 2900,
+        quantity: 2,
+        planKey: "hat_monthly",
+        interval: { length: 1, unit: "months" },
+        startDate: "2026-09-28",
+        metadata: { userId: "user_1" },
+      },
+    );
+    expect(result).toEqual({ subscriptionId: "sub_api" });
+    const createCall = fetchMock.mock.calls[0] as unknown as
+      | [string, RequestInit]
+      | undefined;
+    const request = JSON.parse(String(createCall?.[1]?.body));
+    const subscription = request.ARBCreateSubscriptionRequest
+      .subscription as Record<string, unknown>;
+    expect(subscription.amount).toBe("58.00");
+    expect(subscription.paymentSchedule).toEqual({
+      interval: { length: 1, unit: "months" },
+      startDate: "2026-09-28",
+      totalOccurrences: 9999,
+    });
+    expect(subscription.profile).toEqual({
+      customerProfileId: "profile_1",
+      customerPaymentProfileId: "pay_1",
+    });
+    expect(runMutation).toHaveBeenCalledWith(
+      components.authorizenet.private.handleSubscriptionUpsert,
+      expect.objectContaining({
+        subscriptionId: "sub_api",
+        customerProfileId: "profile_1",
+        amount: 5800,
+        unitAmount: 2900,
+        quantity: 2,
+        planKey: "hat_monthly",
+        cancelAtPeriodEnd: false,
+        metadata: { userId: "user_1" },
+      }),
+    );
+  });
+
+  test("refreshSubscription upserts the local ARB row", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse(
+          ok({
+            subscription: {
+              id: "sub_1",
+              name: "hat_monthly",
+              amount: 29,
+              status: "active",
+              paymentSchedule: {
+                interval: { length: 1, unit: "months" },
+                startDate: "2026-09-01",
+              },
+              profile: {
+                customerProfileId: "profile_1",
+                paymentProfile: { customerPaymentProfileId: "pay_1" },
+              },
+            },
+          }),
+        ),
+      ),
+    );
+    const runMutation = vi.fn().mockResolvedValue(null);
+    const client = new AuthorizeNet(components.authorizenet, credentials);
+    const result = await client.refreshSubscription(
+      {
+        runQuery: vi.fn().mockResolvedValue({
+          subscriptionId: "sub_1",
+          customerProfileId: "profile_1",
+          unitAmount: 2900,
+          quantity: 1,
+          planKey: "hat_monthly",
+          metadata: { userId: "user_1" },
+        }),
+        runMutation,
+        runAction: vi.fn(),
+      },
+      { subscriptionId: "sub_1" },
+    );
+    expect(result).toMatchObject({
+      subscriptionId: "sub_1",
+      status: "active",
+      amountCents: 2900,
+    });
+    expect(runMutation).toHaveBeenCalledWith(
+      components.authorizenet.private.handleSubscriptionUpsert,
+      expect.objectContaining({
+        subscriptionId: "sub_1",
+        customerProfileId: "profile_1",
+        status: "active",
+        planKey: "hat_monthly",
+        metadata: { userId: "user_1" },
+      }),
     );
   });
 

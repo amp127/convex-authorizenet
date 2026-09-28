@@ -28,6 +28,7 @@ import type { ComponentApi } from "../component/_generated/component.js";
 export type AuthorizeNetComponent = ComponentApi;
 
 export type { RegisterRoutesConfig, AuthorizeNetEventHandlers, AuthorizeNetNotification };
+export { assertHostedReturnUrl } from "./api.js";
 
 const OPEN_ENDED_OCCURRENCES = 9999;
 
@@ -355,6 +356,192 @@ export class AuthorizeNet {
     return {
       token,
       formUrl: gateway.endpoints.profileForm,
+    };
+  }
+
+  /**
+   * Charge a saved CIM payment profile and store the payment locally.
+   * The payment webhook remains idempotent on transId.
+   */
+  async createProfileCharge(
+    ctx: ActionCtx,
+    args: {
+      customerProfileId: string;
+      customerPaymentProfileId: string;
+      amount: number;
+      metadata?: Record<string, string>;
+      invoiceNumber?: string;
+      description?: string;
+    },
+  ) {
+    if (!Number.isInteger(args.amount) || args.amount < 1) {
+      throw new Error("amount must be a positive integer number of cents");
+    }
+    const gateway = this.gateway();
+    const created = await gateway.createProfileTransaction({
+      amount: centsToDollars(args.amount),
+      customerProfileId: args.customerProfileId,
+      customerPaymentProfileId: args.customerPaymentProfileId,
+      invoiceNumber: args.invoiceNumber,
+      description: args.description,
+    });
+    const transaction = await gateway.getTransactionDetails(created.transId);
+    const status = resolvePaymentStatus({
+      eventType: "net.authorize.payment.authcapture.created",
+      responseCode: transaction.responseCode ?? created.responseCode,
+      accountType: transaction.accountType,
+      transactionStatus: transaction.transactionStatus,
+    });
+    const createdUnixSeconds = createdUnix(
+      transaction.submitTimeUTC,
+      new Date().toISOString(),
+    );
+    await ctx.runMutation(this.component.private.handlePaymentUpsert, {
+      transId: transaction.transId,
+      refTransId: transaction.refTransId,
+      customerProfileId:
+        transaction.customerProfileId ?? args.customerProfileId,
+      amount: transaction.amountCents || args.amount,
+      currency: this.credentials.currency,
+      status,
+      accountType: transaction.accountType,
+      transactionStatus: transaction.transactionStatus,
+      created: createdUnixSeconds,
+      metadata: args.metadata,
+    });
+    await ctx.runMutation(this.component.private.upsertPaymentProfile, {
+      customerProfileId:
+        transaction.customerProfileId ?? args.customerProfileId,
+      customerPaymentProfileId:
+        transaction.customerPaymentProfileId ?? args.customerPaymentProfileId,
+      brand: transaction.cardType,
+      last4: transaction.last4,
+      isDefault: true,
+    });
+    return {
+      transId: transaction.transId,
+      amountCents: transaction.amountCents || args.amount,
+      status,
+      created: createdUnixSeconds,
+      ...(transaction.accountType ? { accountType: transaction.accountType } : {}),
+    };
+  }
+
+  /**
+   * Re-read a CIM customer from Authorize.net and upsert local payment profiles.
+   * Use this when a hosted profile page saved a card but the webhook was missed.
+   */
+  async refreshCustomerProfiles(
+    ctx: ActionCtx,
+    args: { customerProfileId: string },
+  ) {
+    const profile = await this.gateway().getCustomerProfile(args.customerProfileId);
+    await syncCustomer(ctx, this.component, profile);
+    return {
+      customerProfileId: profile.customerProfileId,
+      paymentProfiles: profile.paymentProfiles,
+    };
+  }
+
+  /**
+   * Create an ARB subscription on a saved CIM payment profile.
+   * `amount` is the unit price in cents. Authorize.net bills on `startDate`
+   * (UTC today by default). Hosted subscription checkout is different: it
+   * charges the first period immediately and starts ARB on the next interval.
+   */
+  async createSubscription(
+    ctx: ActionCtx,
+    args: {
+      customerProfileId: string;
+      customerPaymentProfileId: string;
+      amount: number;
+      interval: BillingInterval;
+      planKey?: string;
+      quantity?: number;
+      startDate?: string;
+      metadata?: Record<string, string>;
+    },
+  ) {
+    const quantity = args.quantity ?? 1;
+    if (!Number.isInteger(args.amount) || args.amount < 1) {
+      throw new Error("amount must be a positive integer number of cents");
+    }
+    if (!Number.isInteger(quantity) || quantity < 1) {
+      throw new Error("quantity must be a positive integer");
+    }
+    if (!args.interval || !Number.isInteger(args.interval.length) || args.interval.length < 1) {
+      throw new Error("interval is required");
+    }
+    const startDate = args.startDate ?? new Date().toISOString().slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate)) {
+      throw new Error("startDate must be YYYY-MM-DD");
+    }
+
+    const planKey = args.planKey ?? "Subscription";
+    const billedAmount = args.amount * quantity;
+    const subscriptionId = await this.gateway().createSubscription({
+      name: planKey,
+      amount: centsToDollars(billedAmount),
+      intervalLength: args.interval.length,
+      intervalUnit: args.interval.unit,
+      startDate,
+      customerProfileId: args.customerProfileId,
+      customerPaymentProfileId: args.customerPaymentProfileId,
+      description: planKey,
+    });
+    await ctx.runMutation(this.component.private.handleSubscriptionUpsert, {
+      subscriptionId,
+      customerProfileId: args.customerProfileId,
+      customerPaymentProfileId: args.customerPaymentProfileId,
+      status: "active",
+      amount: billedAmount,
+      unitAmount: args.amount,
+      quantity,
+      intervalLength: args.interval.length,
+      intervalUnit: args.interval.unit,
+      planKey,
+      currentPeriodEnd: currentPeriodEndUnix({
+        startDate,
+        intervalLength: args.interval.length,
+        intervalUnit: args.interval.unit,
+      }),
+      cancelAtPeriodEnd: false,
+      metadata: args.metadata,
+    });
+    return { subscriptionId };
+  }
+
+  /**
+   * Re-read an ARB subscription from Authorize.net and upsert the local row.
+   * Use this when a webhook was missed.
+   */
+  async refreshSubscription(
+    ctx: ActionCtx,
+    args: { subscriptionId: string },
+  ) {
+    const remote = await this.gateway().getSubscription(args.subscriptionId);
+    const local = await ctx.runQuery(this.component.public.getSubscription, {
+      subscriptionId: args.subscriptionId,
+    });
+    const customerProfileId = remote.customerProfileId ?? local?.customerProfileId;
+    if (!customerProfileId) {
+      throw new Error("Cannot refresh a subscription without a customer profile");
+    }
+    const status = mapSubscriptionStatus(remote.status);
+    await syncSubscriptionRecord(ctx, this.component, remote, {
+      status,
+      customerProfileId,
+      customerPaymentProfileId:
+        remote.customerPaymentProfileId ?? local?.customerPaymentProfileId,
+      unitAmount: local?.unitAmount,
+      quantity: local?.quantity,
+      planKey: local?.planKey ?? remote.name,
+      metadata: local?.metadata,
+    });
+    return {
+      subscriptionId: remote.subscriptionId,
+      status,
+      amountCents: remote.amountCents,
     };
   }
 
